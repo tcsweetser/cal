@@ -5,6 +5,11 @@ import { findEventMappingsBySource } from "../src/db/schema";
 import { GoogleCalendarMock } from "./helpers/googleMock";
 import { createTestUser, createTestAccount } from "./helpers/fixtures";
 
+function originEventIdOf(body: Record<string, unknown>): string | undefined {
+  const props = body.extendedProperties as { private?: { originEventId?: string } } | undefined;
+  return props?.private?.originEventId;
+}
+
 let mock: GoogleCalendarMock;
 
 beforeEach(() => {
@@ -298,4 +303,152 @@ it("recovers from a stale in_progress lock instead of deadlocking forever", asyn
     .all<{ status: string }>();
   expect(results[0]!.status).toBe("error"); // the stale lock was marked error, not left dangling
   expect(results.some((r) => r.status === "success")).toBe(true); // and a real run completed after it
+});
+
+it("a replica deleted by hand (PATCH 404) is re-created instead of wedging the account forever", async () => {
+  const userId = await createTestUser();
+  await createTestAccount(userId, "primary", { email: "me@example.com", accessToken: "tok-primary" });
+  const biz = await createTestAccount(userId, "secondary", {
+    email: "biz@example.com",
+    tag: "business",
+    accessToken: "tok-biz",
+  });
+
+  const nativeEvent = {
+    id: "ev1",
+    status: "confirmed" as const,
+    transparency: "opaque" as const,
+    start: { dateTime: "2026-08-12T10:00:00Z" },
+    end: { dateTime: "2026-08-12T11:00:00Z" },
+  };
+
+  mock.queueList("tok-biz", { events: [nativeEvent], nextSyncToken: "biz-token-1" });
+  await runFullSync(env, userId);
+  const originalMapping = (await findEventMappingsBySource(env.DB, biz.id, "ev1"))[0]!;
+  expect(mock.inserts).toHaveLength(1);
+
+  // Second sync: event unchanged on the source, but its Primary-side replica
+  // was deleted out from under us — the PATCH to fix it up will 404.
+  mock.makeNextPatchGone(originalMapping.target_event_id);
+  mock.queueList("tok-biz", { events: [nativeEvent], nextSyncToken: "biz-token-2" });
+  await runFullSync(env, userId);
+
+  expect(mock.inserts).toHaveLength(2); // the gone replica was re-created, not just dropped
+  const mappingsAfter = await findEventMappingsBySource(env.DB, biz.id, "ev1");
+  expect(mappingsAfter).toHaveLength(1); // still exactly one mapping for this (source, target) pair
+  expect(mappingsAfter[0]!.target_event_id).not.toBe(originalMapping.target_event_id); // points at the new replica
+
+  const logs = await env.DB.prepare("SELECT status FROM sync_logs WHERE user_id = ? ORDER BY created_at DESC LIMIT 1")
+    .bind(userId)
+    .first<{ status: string }>();
+  expect(logs?.status).toBe("success"); // recovered cleanly, not logged as an error
+});
+
+it("one event that can never be inserted doesn't block the rest of the delta or advancing the syncToken", async () => {
+  const userId = await createTestUser();
+  await createTestAccount(userId, "primary", { email: "me@example.com", accessToken: "tok-primary" });
+  const biz = await createTestAccount(userId, "secondary", {
+    email: "biz@example.com",
+    tag: "business",
+    accessToken: "tok-biz",
+  });
+
+  mock.poisonInsertsForEvent("ev-poison");
+  mock.queueList("tok-biz", {
+    events: [
+      {
+        id: "ev-poison",
+        status: "confirmed",
+        transparency: "opaque",
+        start: { dateTime: "2026-08-12T09:00:00Z" },
+        end: { dateTime: "2026-08-12T09:30:00Z" },
+      },
+      {
+        id: "ev-good",
+        status: "confirmed",
+        transparency: "opaque",
+        start: { dateTime: "2026-08-12T10:00:00Z" },
+        end: { dateTime: "2026-08-12T11:00:00Z" },
+      },
+    ],
+    nextSyncToken: "biz-token-1",
+  });
+
+  await runFullSync(env, userId);
+
+  // The good event still fanned out despite the poisoned one failing.
+  expect(mock.inserts.some((i) => originEventIdOf(i.body) === "ev-good")).toBe(true);
+  expect(await findEventMappingsBySource(env.DB, biz.id, "ev-good")).not.toHaveLength(0);
+  expect(await findEventMappingsBySource(env.DB, biz.id, "ev-poison")).toHaveLength(0);
+
+  // The run is logged as an error (so it's visible), but the syncToken still
+  // advanced — the critical part: a poisoned event doesn't cause the same
+  // delta to be replayed and fail identically forever.
+  const stored = await env.DB.prepare(
+    "SELECT sync_token FROM sync_tokens WHERE user_id = ? AND account_id = ?",
+  )
+    .bind(userId, biz.id)
+    .first<{ sync_token: string }>();
+  expect(stored?.sync_token).toBe("biz-token-1");
+
+  const log = await env.DB.prepare("SELECT status, message FROM sync_logs WHERE user_id = ? ORDER BY created_at DESC LIMIT 1")
+    .bind(userId)
+    .first<{ status: string; message: string }>();
+  expect(log?.status).toBe("error");
+  expect(log?.message).toContain("ev-poison");
+}, 10000);
+
+it("410 recovery reconciles pre-existing mappings, removing replicas for events deleted while the token was stale", async () => {
+  const userId = await createTestUser();
+  await createTestAccount(userId, "primary", { email: "me@example.com", accessToken: "tok-primary" });
+  const biz = await createTestAccount(userId, "secondary", {
+    email: "biz@example.com",
+    tag: "business",
+    accessToken: "tok-biz",
+  });
+
+  // Round 1: a normal sync creates a mapping.
+  mock.queueList("tok-biz", {
+    events: [
+      {
+        id: "ev-will-vanish",
+        status: "confirmed",
+        transparency: "opaque",
+        start: { dateTime: "2026-08-12T10:00:00Z" },
+        end: { dateTime: "2026-08-12T11:00:00Z" },
+      },
+    ],
+    nextSyncToken: "biz-token-1",
+  });
+  await runFullSync(env, userId);
+  const mappingBefore = await findEventMappingsBySource(env.DB, biz.id, "ev-will-vanish");
+  expect(mappingBefore).toHaveLength(1);
+
+  // Round 2: token expired; the forced full re-sync doesn't even mention the
+  // now-deleted event (Google just omits it, doesn't report a cancellation) —
+  // reconciliation must existence-check it directly.
+  mock.queueList("tok-biz", "410");
+  mock.queueList("tok-biz", { events: [], nextSyncToken: "biz-token-2" });
+  mock.setEventExists("ev-will-vanish", false);
+  await runFullSync(env, userId);
+
+  expect(await findEventMappingsBySource(env.DB, biz.id, "ev-will-vanish")).toHaveLength(0);
+  expect(mock.deletes.some((d) => d.eventId === mappingBefore[0]!.target_event_id)).toBe(true);
+});
+
+it("a genuine race between two concurrent runFullSync calls only lets one proceed", async () => {
+  const userId = await createTestUser();
+  await createTestAccount(userId, "primary", { email: "me@example.com", accessToken: "tok-primary" });
+  await createTestAccount(userId, "secondary", { email: "biz@example.com", tag: "business", accessToken: "tok-biz" });
+
+  mock.queueList("tok-biz", { events: [], nextSyncToken: "biz-token-1" });
+  mock.queueList("tok-biz", { events: [], nextSyncToken: "biz-token-2" }); // only consumed if the race isn't closed
+
+  await Promise.all([runFullSync(env, userId), runFullSync(env, userId)]);
+
+  const { results } = await env.DB.prepare("SELECT status FROM sync_logs WHERE user_id = ?")
+    .bind(userId)
+    .all<{ status: string }>();
+  expect(results).toHaveLength(1); // the loser never even inserted a sync_logs row
+  expect(results[0]!.status).toBe("success");
 });

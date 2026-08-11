@@ -105,11 +105,11 @@ auth.get("/auth/connect-account", requireAuth, (c) => {
   return beginOAuthFlow(c, "connect", tag as AccountTag);
 });
 
-auth.get("/auth/logout", async (c) => {
+auth.post("/auth/logout", async (c) => {
   const sessionId = getCookie(c, SESSION_COOKIE);
   if (sessionId) await destroySession(c.env, sessionId);
   deleteCookie(c, SESSION_COOKIE, { path: "/" });
-  return c.redirect("/auth/login");
+  return c.redirect("/login");
 });
 
 async function handleLoginCallback(

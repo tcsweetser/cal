@@ -62,6 +62,10 @@ export async function createAccount(db: D1Database, input: CreateAccountInput): 
     .run();
 }
 
+export async function markAccountStatus(db: D1Database, accountId: string, status: AccountStatus): Promise<void> {
+  await db.prepare("UPDATE accounts SET status = ? WHERE id = ?").bind(status, accountId).run();
+}
+
 // --- Sync engine (Phase 4) ---
 
 export async function listUserIds(db: D1Database): Promise<string[]> {
@@ -94,8 +98,8 @@ export async function setSyncToken(
   db: D1Database,
   userId: string,
   accountId: string,
-  calendarId: string,
   token: string,
+  calendarId = "primary",
 ): Promise<void> {
   await db
     .prepare(
@@ -137,6 +141,20 @@ export async function findEventMappingsBySource(
   const { results } = await db
     .prepare("SELECT * FROM event_mappings WHERE source_account_id = ? AND source_event_id = ?")
     .bind(sourceAccountId, sourceEventId)
+    .all<EventMappingRow>();
+  return results;
+}
+
+// Used only for 410-recovery reconciliation (syncEngine.ts) — every mapping
+// sourced from one account, regardless of which event, so each can be
+// existence-checked against Google after a forced full re-sync.
+export async function findEventMappingsBySourceAccount(
+  db: D1Database,
+  sourceAccountId: string,
+): Promise<EventMappingRow[]> {
+  const { results } = await db
+    .prepare("SELECT * FROM event_mappings WHERE source_account_id = ?")
+    .bind(sourceAccountId)
     .all<EventMappingRow>();
   return results;
 }
@@ -197,8 +215,21 @@ export interface SyncLogRow {
   created_at: string;
 }
 
-export async function startSyncLog(db: D1Database, id: string, userId: string): Promise<void> {
-  await db.prepare("INSERT INTO sync_logs (id, user_id, status) VALUES (?, ?, 'in_progress')").bind(id, userId).run();
+// Atomic compare-and-insert: returns false if another run's in_progress row
+// already exists (a manual trigger racing the cron, or vice versa), rather
+// than the caller doing a separate SELECT-then-INSERT that both racers could
+// pass. Genuinely-stale lock recovery (see runFullSync) still needs its own
+// read first — that narrower window is accepted, see plan.md §5.3.
+export async function tryStartSyncLog(db: D1Database, id: string, userId: string): Promise<boolean> {
+  const result = await db
+    .prepare(
+      `INSERT INTO sync_logs (id, user_id, status)
+       SELECT ?, ?, 'in_progress'
+       WHERE NOT EXISTS (SELECT 1 FROM sync_logs WHERE user_id = ? AND status = 'in_progress')`,
+    )
+    .bind(id, userId, userId)
+    .run();
+  return result.meta.changes === 1;
 }
 
 export async function completeSyncLog(

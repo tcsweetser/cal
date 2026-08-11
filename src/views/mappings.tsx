@@ -2,9 +2,11 @@ import type { FC } from "hono/jsx";
 import type { AccountRow } from "../db/schema";
 import { Layout } from "./layout";
 
-// Read-only: the tag is fixed at connect time (see /dashboard's connect form
-// and plan.md §5.4 — accounts.tag is NOT NULL from the moment the row is
-// created), so there is nothing to edit here yet.
+// Read-only: for `secondary` accounts, the tag is fixed at connect time (see
+// /dashboard's connect form and plan.md §5.4 — the schema requires
+// `accounts.tag` to be set the moment a secondary row is created, never
+// NULL). `primary` accounts always have `tag = NULL` — there's only one, so
+// nothing to label. Either way, there's nothing to edit here yet.
 export const MappingsPage: FC<{ accounts: AccountRow[] }> = ({ accounts }) => (
   <Layout title="Roles & Tags">
     <h1>Roles &amp; Tags</h1>

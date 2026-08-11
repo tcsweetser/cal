@@ -34,6 +34,18 @@ interface GoogleTokenResponse {
   error_description?: string;
 }
 
+// Thrown specifically for Google's invalid_grant — the refresh token itself
+// has been revoked (user pulled access in their Google Account settings) or
+// expired from inactivity, as distinct from a transient failure. The caller
+// (syncEngine's TokenCache) uses this to mark the account revoked instead of
+// retrying it forever.
+export class RefreshTokenInvalidError extends Error {
+  constructor(public readonly accountId: string) {
+    super(`Refresh token for account ${accountId} is no longer valid (revoked or expired)`);
+    this.name = "RefreshTokenInvalidError";
+  }
+}
+
 async function refreshTokens(env: Env, accountId: string, refreshToken: string): Promise<StoredTokens> {
   const res = await fetch("https://oauth2.googleapis.com/token", {
     method: "POST",
@@ -48,6 +60,7 @@ async function refreshTokens(env: Env, accountId: string, refreshToken: string):
 
   const data = await res.json<GoogleTokenResponse>();
   if (!res.ok || !data.access_token || !data.expires_in) {
+    if (data.error === "invalid_grant") throw new RefreshTokenInvalidError(accountId);
     throw new Error(
       `Token refresh failed for account ${accountId}: ${data.error ?? res.status} ${data.error_description ?? ""}`,
     );

@@ -35,7 +35,17 @@ export async function getSession(c: Context<AppBindings>): Promise<SessionData |
   const raw = await c.env.TOKEN_STORE.get(sessionKvKey(sessionId));
   if (!raw) return null;
 
-  const session = JSON.parse(raw) as SessionData;
+  let session: SessionData;
+  try {
+    session = JSON.parse(raw) as SessionData;
+  } catch {
+    // Corrupt KV value (shouldn't happen, but a 500 on every request with
+    // this cookie — with no way for the user to recover except manually
+    // clearing cookies — is worse than just treating it as logged out).
+    await destroySession(c.env, sessionId);
+    return null;
+  }
+
   if (Date.now() >= session.expiresAt) {
     await destroySession(c.env, sessionId);
     return null;
@@ -45,7 +55,12 @@ export async function getSession(c: Context<AppBindings>): Promise<SessionData |
 
 export const requireAuth: MiddlewareHandler<AppBindings> = async (c, next) => {
   const session = await getSession(c);
-  if (!session) return c.redirect("/auth/login");
+  if (!session) {
+    if (c.req.header("Accept")?.includes("application/json")) {
+      return c.json({ error: "authentication required" }, 401);
+    }
+    return c.redirect("/login");
+  }
   c.set("session", session);
   await next();
 };

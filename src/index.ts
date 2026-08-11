@@ -3,6 +3,7 @@ import type { AppBindings, Env } from "./types";
 import authRoutes from "./routes/auth";
 import dashboardRoutes from "./routes/dashboard";
 import apiRoutes from "./routes/api";
+import publicRoutes from "./routes/public";
 import { listUserIds } from "./db/schema";
 import { runFullSync } from "./services/syncEngine";
 
@@ -12,6 +13,15 @@ app.get("/", (c) => c.redirect("/dashboard"));
 app.route("/", authRoutes);
 app.route("/", dashboardRoutes);
 app.route("/", apiRoutes);
+app.route("/", publicRoutes);
+
+// Without this, an uncaught error is Hono's bare default 500 with nothing
+// logged — with `observability` enabled (wrangler.jsonc), a console.error
+// here is the difference between a debuggable production incident and not.
+app.onError((err, c) => {
+  console.error(`Unhandled error on ${c.req.method} ${c.req.path}:`, err);
+  return c.text("Internal Server Error", 500);
+});
 
 // Isolated per user: runFullSync already isolates per-account failures and
 // records them in sync_logs, but a structural failure (e.g. listing that

@@ -1,4 +1,5 @@
 import type { FC, PropsWithChildren } from "hono/jsx";
+import { raw } from "hono/html";
 
 const css = `
   :root { color-scheme: light dark; }
@@ -9,9 +10,15 @@ const css = `
     padding: 1.5rem;
     line-height: 1.5;
   }
-  nav { display: flex; gap: 1.25rem; margin-bottom: 2rem; padding-bottom: 1rem; border-bottom: 1px solid light-dark(#ddd, #333); }
+  nav { display: flex; align-items: center; gap: 1.25rem; margin-bottom: 2rem; padding-bottom: 1rem; border-bottom: 1px solid light-dark(#ddd, #333); }
   nav a { text-decoration: none; color: inherit; font-weight: 600; }
   nav a:hover { text-decoration: underline; }
+  nav form { margin-left: auto; }
+  nav button.link {
+    font: inherit; font-weight: 600; padding: 0; border: none; background: none; color: inherit;
+    cursor: pointer; text-decoration: none;
+  }
+  nav button.link:hover { text-decoration: underline; }
   h1 { font-size: 1.4rem; }
   table { width: 100%; border-collapse: collapse; margin: 1rem 0; }
   th, td { text-align: left; padding: 0.5rem 0.75rem; border-bottom: 1px solid light-dark(#e5e5e5, #2a2a2a); }
@@ -36,16 +43,20 @@ export const Layout: FC<PropsWithChildren<{ title: string }>> = ({ title, childr
       <meta charset="utf-8" />
       <meta name="viewport" content="width=device-width, initial-scale=1" />
       <title>{title} — CAL</title>
-      <style>{css}</style>
+      <style>{raw(css)}</style>
     </head>
     <body>
       <nav>
         <a href="/dashboard">Accounts</a>
         <a href="/dashboard/mappings">Roles &amp; Tags</a>
         <a href="/dashboard/logs">Sync Logs</a>
-        <a href="/auth/logout" style="margin-left: auto">
-          Log out
-        </a>
+        {/* POST, not a GET link — link prefetchers/crawlers/preview-fetchers
+            following a GET /auth/logout would silently log the user out. */}
+        <form method="post" action="/auth/logout">
+          <button type="submit" class="link">
+            Log out
+          </button>
+        </form>
       </nav>
       <main>{children}</main>
     </body>

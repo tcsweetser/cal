@@ -79,14 +79,18 @@ export async function signJSON(key: CryptoKey, data: unknown): Promise<string> {
 export async function verifyJSON<T>(key: CryptoKey, token: string): Promise<T | null> {
   const [payload, sig] = token.split(".");
   if (!payload || !sig) return null;
-  const valid = await crypto.subtle.verify(
-    "HMAC",
-    key,
-    base64UrlToBytes(sig),
-    new TextEncoder().encode(payload),
-  );
-  if (!valid) return null;
+  // Everything below can throw on malformed input (atob() on non-base64
+  // data throws InvalidCharacterError, not just JSON.parse) — the function's
+  // contract is "null on anything wrong", so all of it needs to be guarded,
+  // not just the final parse.
   try {
+    const valid = await crypto.subtle.verify(
+      "HMAC",
+      key,
+      base64UrlToBytes(sig),
+      new TextEncoder().encode(payload),
+    );
+    if (!valid) return null;
     return JSON.parse(new TextDecoder().decode(base64UrlToBytes(payload))) as T;
   } catch {
     return null;
