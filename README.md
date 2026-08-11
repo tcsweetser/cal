@@ -38,4 +38,4 @@ No secrets are ever committed to this repository. Local development secrets live
 
 ## License
 
-TBD.
+[PolyForm Noncommercial License 1.0.0](LICENSE) — free for noncommercial use. Commercial use is not licensed by these terms; contact the licensor (see [LICENSE](LICENSE)) to discuss commercial terms.
