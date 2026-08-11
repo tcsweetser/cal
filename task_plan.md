@@ -14,9 +14,11 @@ Implement the Cloudflare Worker described in `plan.md` / `claude_code_prompt.md`
 
 ## Phases (mirrors plan.md §7, with concrete file targets + verification per phase)
 
-- [ ] **Phase 1: Project Skeleton & Config**
-  - Files: `package.json`, `tsconfig.json`, `wrangler.jsonc`, `.gitignore`, `.env.example`, `src/types.ts` (Env interface stub)
-  - Verify: `npx tsc --noEmit` runs clean on the empty skeleton; `npx wrangler dry-run` (or `wrangler deploy --dry-run`) succeeds with stub bindings.
+- [x] **Phase 1: Project Skeleton & Config** — done
+  - Files created: `package.json`, `tsconfig.json`, `wrangler.jsonc`, `.env.example`, `src/types.ts` (Env interface), `src/index.ts` (minimal Hono fetch handler + scheduled stub, needed for the build to actually run — full logic is Phase 4). `.gitignore` extended with `node_modules/`, `.wrangler/`, `.dev.vars`, `dist/`, generated `worker-configuration.d.ts`.
+  - Deviated from the original dependency plan: `wrangler types` (not `@cloudflare/workers-types`) is now Cloudflare's recommended source of runtime types — swapped mid-phase after `wrangler types` itself flagged the older package as superseded. Added `@types/node` since `nodejs_compat` is set.
+  - Verified for real, not just statically: `tsc --noEmit` clean, `wrangler deploy --dry-run` succeeds (shows both bindings), and `wrangler dev` actually boots and serves `GET /` → `200 {"name":"cf-cal-replication","status":"skeleton"}`.
+  - Not committed to git yet — pending user go-ahead.
 
 - [ ] **Phase 2: Database Migration**
   - Unblocked — role/tag model finalized above.
@@ -53,4 +55,4 @@ Implement the Cloudflare Worker described in `plan.md` / `claude_code_prompt.md`
 - **Self-caught, this session**: the per-target origin-comparison loop guard (designed to fix the original P0 bug) silently reintroduced a *different* correctness bug — duplicate event delivery — once the role model was generalized to "every secondary is always a sync source." Caught during a deliberate re-trace before any code was written; no implementation impact, but flagging per the pattern: every change to the loop-prevention mechanism needs a full re-trace against the current topology, not just the specific case it was designed to fix.
 
 ## Status
-**Pre-Phase-1, unblocked.** Docs (`plan.md`, `claude_code_prompt.md`) and this plan are fully synced on the finalized 2-role + tag model and single-hop topology. Both pre-Phase-1 blockers resolved. Not yet a git repository. Ready to start Phase 1 (project skeleton) on request.
+**Phase 1 done, Phase 2 next.** Skeleton worker builds, type-checks, dry-run deploys, and boots under `wrangler dev` with a real HTTP response. Repo is on GitHub (`git@github.com:tcsweetser/cal.git`) with a PolyForm Noncommercial license. Phase 1's files are on disk but not yet committed — awaiting go-ahead. Phase 2 (D1 migration) is unblocked and next.

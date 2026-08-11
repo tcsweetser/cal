@@ -4,7 +4,7 @@ Open-source, edge-deployed system that keeps multiple Google Calendar accounts (
 
 ## Status
 
-🚧 **Planning stage.** Architecture, data model, and sync algorithm are finalized and audited (see below). Implementation has not started — there is no `src/`, no `wrangler.jsonc`, and nothing runnable yet. Setup instructions below describe the *planned* deployment process and will not work until Phase 1–2 land.
+🚧 **Phase 1 complete (project skeleton).** A minimal Hono worker boots, type-checks, and passes `wrangler deploy --dry-run`. No real functionality yet — no database schema, no auth, no sync engine. Google Cloud/KV/D1 resources have not been provisioned, so the setup steps below won't fully work until Phase 2+ land.
 
 Full implementation plan and progress tracking: [`task_plan.md`](task_plan.md).
 
@@ -23,14 +23,15 @@ Full implementation plan and progress tracking: [`task_plan.md`](task_plan.md).
 
 Cloudflare Workers · Hono · Cloudflare D1 · Cloudflare KV · Cron Triggers · Google Calendar API v3 · Google OAuth 2.0 (PKCE)
 
-## Setup (once implemented)
+## Setup (partially implemented — see Status)
 
-1. Create a Google Cloud Console project, enable the Calendar API, and create OAuth 2.0 credentials (Web application type).
-2. `npx wrangler kv namespace create TOKEN_STORE` and `npx wrangler d1 create cal-replication-db`, then fill the resulting IDs into `wrangler.jsonc`.
-3. Copy `.env.example` to `.dev.vars` for local development.
-4. Set production secrets: `npx wrangler secret put GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `SESSION_SECRET`.
-5. Apply the D1 migration: `npx wrangler d1 migrations apply DB`.
-6. `npx wrangler dev` locally, or `npx wrangler deploy` to publish.
+1. `npm install`, then `npm run cf-typegen` to generate `worker-configuration.d.ts` from `wrangler.jsonc` (gitignored, regenerate after any binding change).
+2. Create a Google Cloud Console project, enable the Calendar API, and create OAuth 2.0 credentials (Web application type).
+3. `npx wrangler kv namespace create TOKEN_STORE` and `npx wrangler d1 create cal-replication-db`, then fill the resulting IDs into `wrangler.jsonc`.
+4. Copy `.env.example` to `.dev.vars` for local development.
+5. Set production secrets: `npx wrangler secret put GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `SESSION_SECRET`, `TOKEN_ENCRYPTION_KEY`, `PRIMARY_ACCOUNT_EMAIL`.
+6. Apply the D1 migration (not written yet — Phase 2): `npm run db:migrate:local` / `npm run db:migrate:remote`.
+7. `npm run dev` locally, or `npm run deploy` to publish.
 
 ## Security
 

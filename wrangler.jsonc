@@ -1,0 +1,34 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "cf-cal-replication",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-08-11",
+  "compatibility_flags": ["nodejs_compat"],
+
+  "observability": {
+    "enabled": true
+  },
+
+  // D1 Database — run `npx wrangler d1 create cal-replication-db` and replace database_id below.
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "cal-replication-db",
+      "database_id": "<YOUR_D1_DATABASE_ID>",
+      "migrations_dir": "./migrations"
+    }
+  ],
+
+  // KV Namespace — run `npx wrangler kv namespace create TOKEN_STORE` and replace id below.
+  "kv_namespaces": [
+    {
+      "binding": "TOKEN_STORE",
+      "id": "<YOUR_KV_NAMESPACE_ID>"
+    }
+  ],
+
+  // Runs the sync engine every 10 minutes (plan.md §5, incremental delta sync).
+  "triggers": {
+    "crons": ["*/10 * * * *"]
+  }
+}
