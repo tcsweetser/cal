@@ -30,7 +30,7 @@ Cloudflare Workers · Hono · Cloudflare D1 · Cloudflare KV · Cron Triggers ·
 3. `npx wrangler kv namespace create TOKEN_STORE` and `npx wrangler d1 create cal-replication-db`, then fill the resulting IDs into `wrangler.jsonc`.
 4. Copy `.env.example` to `.dev.vars` for local development.
 5. Set production secrets: `npx wrangler secret put GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `SESSION_SECRET`, `TOKEN_ENCRYPTION_KEY`, `PRIMARY_ACCOUNT_EMAIL`.
-6. Apply the D1 migration (not written yet — Phase 2): `npm run db:migrate:local` / `npm run db:migrate:remote`.
+6. Apply the D1 migration: `npm run db:migrate:local` / `npm run db:migrate:remote`.
 7. `npm run dev` locally, or `npm run deploy` to publish.
 
 ## Security

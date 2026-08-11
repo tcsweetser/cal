@@ -131,61 +131,108 @@ Rules:
 
 ## 4. Database Schema (D1 SQL Migration)
 
-### `migrations/0001_initial_schema.sql`
+**Implemented and verified** in `migrations/0001_initial_schema.sql` (Phase 2, rechecked by an independent code-review pass). Beyond the original draft and the P2 #1 FK-cascade fix, the recheck found and closed:
+
+- **A duplicate-delivery bug in the schema itself** (same class as the topology bug caught earlier in this project, just at the data layer): nothing stopped two different source events from both claiming the same `(target_account_id, target_event_id)` — if that ever happened, whichever mapping's deletion fired first would orphan the other, silently. Closed with a second `UNIQUE` index on `(target_account_id, target_event_id)`, plus `CHECK(source_account_id <> target_account_id)` to rule out self-mapping.
+- **Every FK child column except `accounts.user_id` was unindexed**, meaning every cascade delete and every dashboard logs-page query was a full table scan (confirmed via `EXPLAIN QUERY PLAN`, now confirmed fixed the same way). Added indexes on `event_mappings(user_id)`, `sync_tokens(account_id)`, and `sync_logs(user_id, created_at DESC)`.
+- **The same Google account could be linked twice to one user** (`accounts.email` had no uniqueness constraint) — under the full-mesh topology this means real duplicate delivery to one physical calendar. Closed with `UNIQUE(user_id, email COLLATE NOCASE)` (case-insensitive: Google account emails are effectively case-insensitive).
+- **`accounts.status` had no value domain** despite being filtered on by the sync engine ("for each *active* source account," §5.3 step 2) — a typo silently drops an account from sync with no error anywhere. Added `CHECK(status IN ('active','revoked','error'))`.
+- **`TEXT PRIMARY KEY` columns accepted `NULL`** (a SQLite quirk — only `INTEGER PRIMARY KEY` is implicitly `NOT NULL`) and columns with a `DEFAULT` could still be explicitly set to `NULL`. Added `NOT NULL` throughout.
+- **Timestamps were space-separated (`CURRENT_TIMESTAMP`), not RFC3339**, and would collate incorrectly against Google Calendar's own RFC3339 timestamps in any future comparison. Switched to `strftime('%Y-%m-%dT%H:%M:%fZ','now')` everywhere.
+- **`updated_at` only ever fired on `INSERT`**, never on `UPDATE`, despite §5.3 step 6 rewriting `sync_tokens` every cron run. Added `AFTER UPDATE` triggers on `event_mappings` and `sync_tokens` rather than relying on every future call site remembering to set it by hand.
+
+All of the above verified with real inserts/updates against a local D1 instance, not just read for syntax — see `task_plan.md` Phase 2 entry for the specific test cases.
+
 ```sql
 CREATE TABLE IF NOT EXISTS users (
-    id TEXT PRIMARY KEY,
+    id TEXT PRIMARY KEY NOT NULL,
     email TEXT UNIQUE NOT NULL,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
 
 CREATE TABLE IF NOT EXISTS accounts (
-    id TEXT PRIMARY KEY,
+    id TEXT PRIMARY KEY NOT NULL,
     user_id TEXT NOT NULL,
-    email TEXT NOT NULL,
+    email TEXT NOT NULL COLLATE NOCASE,
     role TEXT NOT NULL CHECK(role IN ('primary', 'secondary')),
     tag TEXT CHECK(tag IN ('business', 'side_hustle', 'personal')),
-    status TEXT NOT NULL DEFAULT 'active',
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active', 'revoked', 'error')),
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
     FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE,
     CHECK(
         (role = 'primary' AND tag IS NULL) OR
         (role = 'secondary' AND tag IS NOT NULL)
     )
 );
--- Note: "at least one secondary account per user" and "exactly one primary account per user"
--- are cross-row invariants SQLite CHECK constraints cannot express — enforce at the application
--- layer (dashboard onboarding + API validation before allowing manual/cron sync to run).
+-- "At least one secondary account per user" and "exactly one primary account per user"
+-- are cross-row invariants SQLite CHECK constraints cannot express — enforce at the
+-- application layer (dashboard onboarding + API validation before allowing sync to run).
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_accounts_user_email ON accounts(user_id, email);
 
 CREATE TABLE IF NOT EXISTS sync_tokens (
     user_id TEXT NOT NULL,
     account_id TEXT NOT NULL,
     calendar_id TEXT NOT NULL DEFAULT 'primary',
     sync_token TEXT NOT NULL,
-    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    PRIMARY KEY (user_id, account_id, calendar_id)
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    PRIMARY KEY (user_id, account_id, calendar_id),
+    FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE,
+    FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE
 );
 
+CREATE INDEX IF NOT EXISTS idx_sync_tokens_account ON sync_tokens(account_id);
+
+CREATE TRIGGER IF NOT EXISTS trg_sync_tokens_touch
+AFTER UPDATE ON sync_tokens
+BEGIN
+    UPDATE sync_tokens
+    SET updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+    WHERE user_id = NEW.user_id AND account_id = NEW.account_id AND calendar_id = NEW.calendar_id;
+END;
+
 CREATE TABLE IF NOT EXISTS event_mappings (
-    id TEXT PRIMARY KEY,
+    id TEXT PRIMARY KEY NOT NULL,
     user_id TEXT NOT NULL,
     source_account_id TEXT NOT NULL,
     source_event_id TEXT NOT NULL,
     target_account_id TEXT NOT NULL,
     target_event_id TEXT NOT NULL,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE,
+    FOREIGN KEY(source_account_id) REFERENCES accounts(id) ON DELETE CASCADE,
+    FOREIGN KEY(target_account_id) REFERENCES accounts(id) ON DELETE CASCADE,
+    CHECK(source_account_id <> target_account_id)
 );
 
+CREATE UNIQUE INDEX IF NOT EXISTS idx_event_mappings_source_target
+    ON event_mappings(source_account_id, source_event_id, target_account_id);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_event_mappings_target
+    ON event_mappings(target_account_id, target_event_id);
+
+CREATE INDEX IF NOT EXISTS idx_event_mappings_user ON event_mappings(user_id);
+
+CREATE TRIGGER IF NOT EXISTS trg_event_mappings_touch
+AFTER UPDATE ON event_mappings
+BEGIN
+    UPDATE event_mappings
+    SET updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+    WHERE id = NEW.id;
+END;
+
 CREATE TABLE IF NOT EXISTS sync_logs (
-    id TEXT PRIMARY KEY,
+    id TEXT PRIMARY KEY NOT NULL,
     user_id TEXT NOT NULL,
     status TEXT NOT NULL CHECK(status IN ('success', 'error', 'in_progress')),
     message TEXT,
-    events_processed INTEGER DEFAULT 0,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    events_processed INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
 );
+
+CREATE INDEX IF NOT EXISTS idx_sync_logs_user_time ON sync_logs(user_id, created_at DESC);
 ```
 
 ---
@@ -198,7 +245,7 @@ CREATE TABLE IF NOT EXISTS sync_logs (
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "cf-cal-replication",
   "main": "src/index.ts",
-  "compatibility_date": "2024-09-25",
+  "compatibility_date": "2026-08-04",
   "compatibility_flags": ["nodejs_compat"],
   "triggers": {
     "crons": ["*/10 * * * *"]
@@ -301,7 +348,7 @@ export interface AICalendarAssistantService {
 ## 8. Verification Strategy
 
 1. **Build Verification**:
-   - Run `npm run check` / `npx tsc --noEmit` to verify type safety.
-   - Run `npx wrangler dry-run` to ensure Cloudflare Worker bundle builds cleanly.
+   - Run `npm run typecheck` / `npx tsc --noEmit` to verify type safety.
+   - Run `npx wrangler deploy --dry-run` to ensure Cloudflare Worker bundle builds cleanly.
 2. **Local Simulation**:
    - Run `npx wrangler dev` to verify routes, auth redirects, and D1 / KV binding initializations.
