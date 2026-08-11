@@ -4,7 +4,7 @@ Open-source, edge-deployed system that keeps multiple Google Calendar accounts (
 
 ## Status
 
-🚧 **Phase 3 of 6 complete** (skeleton, DB schema, Google OAuth + encrypted token storage + sessions). No sync engine yet — connecting accounts works, but nothing replicates between calendars until Phase 4. Google Cloud/KV/D1 resources have not been provisioned in any real environment, so the setup steps below are written but unexercised end-to-end (a real Google OAuth grant hasn't been tested — see `task_plan.md` Phase 3 for exactly what has and hasn't been verified).
+🚧 **Phase 4 of 6 complete** (skeleton, DB schema, Google OAuth + encrypted token storage + sessions, and the sync engine itself). The core replication logic — topology fan-out, loop prevention, deletion cascades, 410-Gone recovery — has real automated test coverage (`npm test`) against a real local D1 instance and a hand-built Google Calendar API mock. There's no dashboard UI yet (Phase 5), so accounts can only be connected via direct URLs (`/auth/login`, `/auth/connect-account?tag=...`), and a real end-to-end Google OAuth grant hasn't been exercised in this environment (see `task_plan.md` Phase 3/4 for exactly what has and hasn't been verified).
 
 Full implementation plan and progress tracking: [`task_plan.md`](task_plan.md).
 
@@ -32,6 +32,7 @@ Cloudflare Workers · Hono · Cloudflare D1 · Cloudflare KV · Cron Triggers ·
 5. Set production secrets: `npx wrangler secret put GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `SESSION_SECRET`, `TOKEN_ENCRYPTION_KEY`, `PRIMARY_ACCOUNT_EMAIL`.
 6. Apply the D1 migration: `npm run db:migrate:local` / `npm run db:migrate:remote`.
 7. `npm run dev` locally, or `npm run deploy` to publish. Visit `/auth/login` to sign in as the primary account.
+8. `npm test` runs the sync engine's test suite against a real local D1 instance with a mocked Google Calendar API — no real credentials needed for this one.
 
 ## Security
 
