@@ -9,3 +9,20 @@ export interface Env extends Cloudflare.Env {
   TOKEN_ENCRYPTION_KEY: string;
   PRIMARY_ACCOUNT_EMAIL: string;
 }
+
+export interface SessionData {
+  userId: string;
+  email: string;
+  createdAt: number;
+  expiresAt: number;
+}
+
+// Shared Hono generic — every router/middleware that touches bindings or the
+// session variable should use this instead of redeclaring `{ Bindings: Env }`,
+// so their types can't drift from each other or from src/index.ts.
+export interface AppBindings {
+  Bindings: Env;
+  Variables: {
+    session: SessionData;
+  };
+}

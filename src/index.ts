@@ -1,9 +1,11 @@
 import { Hono } from "hono";
-import type { Env } from "./types";
+import type { AppBindings, Env } from "./types";
+import authRoutes from "./routes/auth";
 
-const app = new Hono<{ Bindings: Env }>();
+const app = new Hono<AppBindings>();
 
 app.get("/", (c) => c.json({ name: "cf-cal-replication", status: "skeleton" }));
+app.route("/", authRoutes);
 
 export default {
   fetch: app.fetch,

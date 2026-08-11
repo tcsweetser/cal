@@ -4,7 +4,7 @@ Open-source, edge-deployed system that keeps multiple Google Calendar accounts (
 
 ## Status
 
-🚧 **Phase 1 complete (project skeleton).** A minimal Hono worker boots, type-checks, and passes `wrangler deploy --dry-run`. No real functionality yet — no database schema, no auth, no sync engine. Google Cloud/KV/D1 resources have not been provisioned, so the setup steps below won't fully work until Phase 2+ land.
+🚧 **Phase 3 of 6 complete** (skeleton, DB schema, Google OAuth + encrypted token storage + sessions). No sync engine yet — connecting accounts works, but nothing replicates between calendars until Phase 4. Google Cloud/KV/D1 resources have not been provisioned in any real environment, so the setup steps below are written but unexercised end-to-end (a real Google OAuth grant hasn't been tested — see `task_plan.md` Phase 3 for exactly what has and hasn't been verified).
 
 Full implementation plan and progress tracking: [`task_plan.md`](task_plan.md).
 
@@ -26,12 +26,12 @@ Cloudflare Workers · Hono · Cloudflare D1 · Cloudflare KV · Cron Triggers ·
 ## Setup (partially implemented — see Status)
 
 1. `npm install`, then `npm run cf-typegen` to generate `worker-configuration.d.ts` from `wrangler.jsonc` (gitignored, regenerate after any binding change).
-2. Create a Google Cloud Console project, enable the Calendar API, and create OAuth 2.0 credentials (Web application type).
+2. Create a Google Cloud Console project, enable the Calendar API, and create OAuth 2.0 credentials (Web application type). Under **Authorized redirect URIs**, add both `http://localhost:8787/auth/callback` (local dev) and `https://<your-worker-domain>/auth/callback` (production) — the worker derives the callback URL from the incoming request's own origin, so it must match exactly or Google will reject the exchange with `redirect_uri_mismatch`.
 3. `npx wrangler kv namespace create TOKEN_STORE` and `npx wrangler d1 create cal-replication-db`, then fill the resulting IDs into `wrangler.jsonc`.
-4. Copy `.env.example` to `.dev.vars` for local development.
+4. Copy `.env.example` to `.dev.vars` for local development. `SESSION_SECRET` and `TOKEN_ENCRYPTION_KEY` must each be real `openssl rand -base64 32` output (32 raw bytes, base64-encoded) — anything else will fail to import as an AES-256/HMAC-SHA256 key.
 5. Set production secrets: `npx wrangler secret put GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `SESSION_SECRET`, `TOKEN_ENCRYPTION_KEY`, `PRIMARY_ACCOUNT_EMAIL`.
 6. Apply the D1 migration: `npm run db:migrate:local` / `npm run db:migrate:remote`.
-7. `npm run dev` locally, or `npm run deploy` to publish.
+7. `npm run dev` locally, or `npm run deploy` to publish. Visit `/auth/login` to sign in as the primary account.
 
 ## Security
 

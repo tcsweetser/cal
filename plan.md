@@ -272,6 +272,14 @@ CREATE INDEX IF NOT EXISTS idx_sync_logs_user_time ON sync_logs(user_id, created
 - Performs automatic POST to `https://oauth2.googleapis.com/token` with `refresh_token` when expired.
 - Updates KV automatically so subsequent calls receive fresh access tokens without re-authenticating.
 
+**Decisions made in Phase 3** (these were open blockers after the Phase 2 recheck):
+
+1. **Token encryption mechanism**: AES-256-GCM via the Workers-native Web Crypto API (`crypto.subtle`), keyed by the dedicated `TOKEN_ENCRYPTION_KEY` secret — a base64-encoded 32-byte key, never `SESSION_SECRET` (kept separate so rotating one doesn't invalidate the other; also the existing `.env.example` guidance `openssl rand -base64 32` already assumed this). Each KV value stores a random 12-byte IV alongside the ciphertext (base64, IV||ciphertext), so no two encryptions of the same token ever produce the same bytes.
+
+2. **PKCE `state`/`code_verifier` storage**: a short-lived (10 min), `HttpOnly`, `Secure`, `SameSite=Lax` cookie (`oauth_flow`) — not KV. It holds `{state, codeVerifier, purpose, tag?}` as base64url JSON plus an HMAC-SHA256 signature (also keyed by `SESSION_SECRET`) so the callback can detect tampering (e.g. a `connect` flow's `tag` or `purpose` being altered in transit) before trusting it. This data is inherently single-browser-scoped and short-lived, so a signed cookie avoids a KV round trip and needs no cleanup job for expired entries, unlike storing it server-side.
+
+3. **KV refresh-race** (flagged after Phase 2's recheck: KV has no compare-and-swap, so two concurrent refreshes for the same account could race). Deliberately **not** solved with a Durable Object mutex in Phase 3 — reasoning: Google's standard OAuth refresh tokens are long-lived and reusable, not single-use/rotating, unless refresh-token rotation is explicitly enabled for the OAuth client (not the default for this project). Under that assumption, two concurrent refresh calls both succeed at Google's end with the same `refresh_token` still valid afterward; the only race is over which of the two freshly-fetched `access_token`s gets persisted last in KV — wasted API call, not a silent de-auth. `tokenManager.ts` re-checks expiry immediately before calling Google (narrows, doesn't eliminate, the race window) but does not implement distributed locking. **This rests on an assumption about Google's default token behavior that should be verified against the actual Google Cloud Console OAuth client config before relying on it in production; if rotation is ever enabled, revisit with a Durable Object mutex** (tracked in `task_plan.md`).
+
 ### 5.3 Core Sync Engine (`src/services/syncEngine.ts`)
 - `runFullSync(env: Env, userId: string)`:
   1. Fetch linked accounts for user from D1 (`DB`).
@@ -302,7 +310,7 @@ CREATE INDEX IF NOT EXISTS idx_sync_logs_user_time ON sync_logs(user_id, created
 - Google SSO Login button on public route.
 - Restrict dashboard access to Primary user email (`PRIMARY_ACCOUNT_EMAIL` or first registered primary account).
 - Views:
-  - Account Connector (`/dashboard`): Add secondary accounts via OAuth connect flow.
+  - Account Connector (`/dashboard`): Add secondary accounts via OAuth connect flow. Since `accounts.tag` is `NOT NULL` for every `secondary` row (schema, §4), the tag must be chosen *before* the account row can be inserted — Phase 3's `/auth/connect-account?tag=business|side_hustle|personal` already takes it as a query param for exactly this reason, so this view's "add account" action is a small form (pick a tag, then redirect into that URL) rather than a separate post-connect edit step.
   - Role Mapping Configuration (`/dashboard/mappings`): Assign role (`primary`, exactly one / `secondary`, at least one) and, for each secondary account, a required `tag` (`business` / `side_hustle` / `personal`) used only as a dashboard label — event titles are not customizable per-tag (see §1 Roles & Tags: fixed generic titles preserve the privacy goal).
   - Sync History & Execution (`/dashboard/logs`): View execution history and manual trigger button (`POST /api/trigger-sync`).
 
