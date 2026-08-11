@@ -1,0 +1,5 @@
+# Reference-only scratch files, not part of the implementation
+gemini-code-*
+
+# Claude Code local session metadata, not part of the project deliverable
+.claude/
