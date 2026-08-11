@@ -220,3 +220,24 @@ export function findActiveSyncLog(db: D1Database, userId: string): Promise<SyncL
     .bind(userId)
     .first<SyncLogRow>();
 }
+
+// --- Dashboard (Phase 5) ---
+
+// Unlike listActiveAccountsForUser (sync engine, active-only), the dashboard
+// shows every linked account regardless of status so a revoked/errored
+// account doesn't just silently vanish from view.
+export async function listAccountsForUser(db: D1Database, userId: string): Promise<AccountRow[]> {
+  const { results } = await db
+    .prepare("SELECT * FROM accounts WHERE user_id = ? ORDER BY role ASC, created_at ASC")
+    .bind(userId)
+    .all<AccountRow>();
+  return results;
+}
+
+export async function listRecentSyncLogs(db: D1Database, userId: string, limit = 20): Promise<SyncLogRow[]> {
+  const { results } = await db
+    .prepare("SELECT * FROM sync_logs WHERE user_id = ? ORDER BY created_at DESC LIMIT ?")
+    .bind(userId, limit)
+    .all<SyncLogRow>();
+  return results;
+}

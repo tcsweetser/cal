@@ -4,7 +4,7 @@ Open-source, edge-deployed system that keeps multiple Google Calendar accounts (
 
 ## Status
 
-🚧 **Phase 4 of 6 complete** (skeleton, DB schema, Google OAuth + encrypted token storage + sessions, and the sync engine itself). The core replication logic — topology fan-out, loop prevention, deletion cascades, 410-Gone recovery — has real automated test coverage (`npm test`) against a real local D1 instance and a hand-built Google Calendar API mock. There's no dashboard UI yet (Phase 5), so accounts can only be connected via direct URLs (`/auth/login`, `/auth/connect-account?tag=...`), and a real end-to-end Google OAuth grant hasn't been exercised in this environment (see `task_plan.md` Phase 3/4 for exactly what has and hasn't been verified).
+🚧 **Phase 5 of 6 complete** — skeleton, DB schema, Google OAuth + encrypted token storage + sessions, the sync engine, and now the dashboard (`/dashboard`, `/dashboard/mappings`, `/dashboard/logs`) and manual sync trigger. The app is click-through-usable end to end once you've done the Google Cloud Console setup below. The one thing not exercised in this development environment is an actual Google OAuth consent-screen grant (no real credentials available here) — everything before and after that step is verified against real local infrastructure (see `task_plan.md` for exactly what's been tested at each phase). Phase 6 (final docs/verification pass) is next.
 
 Full implementation plan and progress tracking: [`task_plan.md`](task_plan.md).
 

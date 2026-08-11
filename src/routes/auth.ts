@@ -10,7 +10,7 @@ import {
   createAccount,
 } from "../db/schema";
 import { storeTokens } from "../services/tokenManager";
-import { createSession, getSession, requireAuth, SESSION_COOKIE } from "../middleware/auth";
+import { createSession, destroySession, getSession, requireAuth, SESSION_COOKIE } from "../middleware/auth";
 import {
   generateCodeVerifier,
   generateCodeChallenge,
@@ -105,6 +105,13 @@ auth.get("/auth/connect-account", requireAuth, (c) => {
   return beginOAuthFlow(c, "connect", tag as AccountTag);
 });
 
+auth.get("/auth/logout", async (c) => {
+  const sessionId = getCookie(c, SESSION_COOKIE);
+  if (sessionId) await destroySession(c.env, sessionId);
+  deleteCookie(c, SESSION_COOKIE, { path: "/" });
+  return c.redirect("/auth/login");
+});
+
 async function handleLoginCallback(
   c: Context<AppBindings>,
   email: string,
@@ -146,7 +153,7 @@ async function handleLoginCallback(
   });
 
   setSessionCookie(c, await createSession(c.env, user.id, email, SESSION_TTL_SECONDS));
-  return c.redirect("/"); // Phase 5 will point this at /dashboard
+  return c.redirect("/dashboard");
 }
 
 async function handleConnectCallback(
@@ -180,7 +187,7 @@ async function handleConnectCallback(
     expires_at: tokens.expires_at,
   });
 
-  return c.redirect("/"); // Phase 5 will point this at /dashboard
+  return c.redirect("/dashboard");
 }
 
 auth.get("/auth/callback", async (c) => {

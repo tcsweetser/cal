@@ -1,13 +1,17 @@
 import { Hono } from "hono";
 import type { AppBindings, Env } from "./types";
 import authRoutes from "./routes/auth";
+import dashboardRoutes from "./routes/dashboard";
+import apiRoutes from "./routes/api";
 import { listUserIds } from "./db/schema";
 import { runFullSync } from "./services/syncEngine";
 
 const app = new Hono<AppBindings>();
 
-app.get("/", (c) => c.json({ name: "cf-cal-replication", status: "skeleton" }));
+app.get("/", (c) => c.redirect("/dashboard"));
 app.route("/", authRoutes);
+app.route("/", dashboardRoutes);
+app.route("/", apiRoutes);
 
 // Isolated per user: runFullSync already isolates per-account failures and
 // records them in sync_logs, but a structural failure (e.g. listing that
