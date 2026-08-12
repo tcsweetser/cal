@@ -204,6 +204,101 @@ export async function deleteEventMapping(db: D1Database, id: string): Promise<vo
   await db.prepare("DELETE FROM event_mappings WHERE id = ?").bind(id).run();
 }
 
+// --- Sync queue (staged/incremental sync, see task_plan.md) ---
+
+export interface SyncQueueItemRow {
+  id: string;
+  user_id: string;
+  account_id: string;
+  event_id: string;
+  event_json: string;
+  created_at: string;
+}
+
+// REPLACE not IGNORE: if the same event is somehow enqueued twice (shouldn't
+// happen given syncAccount only fetches when the queue is empty, but a
+// second copy would mean stale event data if left as INSERT OR IGNORE).
+export async function enqueueEvents(
+  db: D1Database,
+  userId: string,
+  accountId: string,
+  events: Array<{ id: string; json: string }>,
+): Promise<void> {
+  if (events.length === 0) return;
+  const stmt = db.prepare(
+    `INSERT INTO sync_queue (id, user_id, account_id, event_id, event_json) VALUES (?, ?, ?, ?, ?)
+     ON CONFLICT (account_id, event_id) DO UPDATE SET event_json = excluded.event_json`,
+  );
+  await db.batch(events.map((e) => stmt.bind(crypto.randomUUID(), userId, accountId, e.id, e.json)));
+}
+
+export async function countQueuedEvents(db: D1Database, accountId: string): Promise<number> {
+  const row = await db
+    .prepare("SELECT COUNT(*) AS n FROM sync_queue WHERE account_id = ?")
+    .bind(accountId)
+    .first<{ n: number }>();
+  return row?.n ?? 0;
+}
+
+// FIFO: oldest-enqueued first, so a large backlog drains roughly in the
+// order Google originally returned it rather than an arbitrary order.
+export async function dequeuePendingEvents(
+  db: D1Database,
+  accountId: string,
+  limit: number,
+): Promise<SyncQueueItemRow[]> {
+  const { results } = await db
+    .prepare("SELECT * FROM sync_queue WHERE account_id = ? ORDER BY created_at ASC LIMIT ?")
+    .bind(accountId, limit)
+    .all<SyncQueueItemRow>();
+  return results;
+}
+
+export async function deleteQueuedEvent(db: D1Database, id: string): Promise<void> {
+  await db.prepare("DELETE FROM sync_queue WHERE id = ?").bind(id).run();
+}
+
+// Held separately from sync_tokens until the queue a fetch produced is fully
+// drained — see the pending_sync_tokens table comment in the migration for why.
+export async function setPendingSyncToken(
+  db: D1Database,
+  userId: string,
+  accountId: string,
+  token: string,
+  calendarId = "primary",
+): Promise<void> {
+  await db
+    .prepare(
+      `INSERT INTO pending_sync_tokens (user_id, account_id, calendar_id, sync_token) VALUES (?, ?, ?, ?)
+       ON CONFLICT (user_id, account_id, calendar_id) DO UPDATE SET sync_token = excluded.sync_token`,
+    )
+    .bind(userId, accountId, calendarId, token)
+    .run();
+}
+
+// Once the queue for this account is empty, promotes the pending token (the
+// one the fetch that produced that queue would have advanced to) into the
+// real sync_tokens row, and clears the pending one. A no-op, not an error,
+// if there's nothing pending (e.g. an incremental sync whose delta was empty
+// enough to finish inline without ever touching the queue).
+export async function promotePendingSyncToken(
+  db: D1Database,
+  userId: string,
+  accountId: string,
+  calendarId = "primary",
+): Promise<void> {
+  const pending = await db
+    .prepare("SELECT sync_token FROM pending_sync_tokens WHERE user_id = ? AND account_id = ? AND calendar_id = ?")
+    .bind(userId, accountId, calendarId)
+    .first<{ sync_token: string }>();
+  if (!pending) return;
+  await setSyncToken(db, userId, accountId, pending.sync_token, calendarId);
+  await db
+    .prepare("DELETE FROM pending_sync_tokens WHERE user_id = ? AND account_id = ? AND calendar_id = ?")
+    .bind(userId, accountId, calendarId)
+    .run();
+}
+
 export type SyncLogStatus = "in_progress" | "success" | "error";
 
 export interface SyncLogRow {

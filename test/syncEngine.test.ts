@@ -436,6 +436,68 @@ it("410 recovery reconciles pre-existing mappings, removing replicas for events 
   expect(mock.deletes.some((d) => d.eventId === mappingBefore[0]!.target_event_id)).toBe(true);
 });
 
+it("a backlog larger than one invocation's call budget drains across two runs without re-fetching or duplicating", async () => {
+  const userId = await createTestUser();
+  await createTestAccount(userId, "primary", { email: "me@example.com", accessToken: "tok-primary" });
+  const biz = await createTestAccount(userId, "secondary", {
+    email: "biz@example.com",
+    tag: "business",
+    accessToken: "tok-biz",
+  });
+
+  // 40 events, each fanning out to exactly 1 target (primary — no other
+  // secondary in this test) — comfortably over the 35-call-per-invocation
+  // budget (syncEngine.ts's MAX_CALENDAR_API_CALLS_PER_RUN).
+  const events = Array.from({ length: 40 }, (_, i) => ({
+    id: `ev-${i}`,
+    status: "confirmed" as const,
+    transparency: "opaque" as const,
+    start: { dateTime: "2026-08-12T10:00:00Z" },
+    end: { dateTime: "2026-08-12T11:00:00Z" },
+  }));
+  mock.queueList("tok-biz", { events, nextSyncToken: "biz-token-1" });
+
+  await runFullSync(env, userId);
+
+  // 1 call spent on the list, leaving 34 for inserts this round — not all 40.
+  expect(mock.inserts).toHaveLength(34);
+
+  // The batch isn't fully drained yet, so the real syncToken must NOT have
+  // advanced — losing that would mean the 6 leftover events are never seen
+  // again once a future incremental sync moves past them.
+  const midRun = await env.DB.prepare("SELECT sync_token FROM sync_tokens WHERE user_id = ? AND account_id = ?")
+    .bind(userId, biz.id)
+    .first<{ sync_token: string }>();
+  expect(midRun).toBeNull();
+
+  // Second run: biz's already-queued backlog must NOT be re-listed from
+  // Google. Checked via call count on biz's own token specifically (not "no
+  // list calls at all" — the shared budget exhausting on biz's backlog in
+  // round 1 also pushed primary's own first-ever, unrelated fetch to round
+  // 2, which is correct fairness, not something this test is about).
+  const fetchSpy = mock.install();
+  await runFullSync(env, userId);
+
+  const bizListCalls = fetchSpy.mock.calls.filter(([input, init]) => {
+    const url = new URL(String(input));
+    const isList = url.pathname.endsWith("/events") && (init?.method ?? "GET") === "GET";
+    const headers = init?.headers as Record<string, string> | undefined;
+    return isList && headers?.Authorization === "Bearer tok-biz";
+  });
+  expect(bizListCalls).toHaveLength(0);
+
+  expect(mock.inserts).toHaveLength(40); // every event now replicated exactly once
+  for (const event of events) {
+    expect(await findEventMappingsBySource(env.DB, biz.id, event.id)).toHaveLength(1); // never duplicated
+  }
+
+  // Queue is fully drained now — the pending syncToken is finally promoted.
+  const afterRun = await env.DB.prepare("SELECT sync_token FROM sync_tokens WHERE user_id = ? AND account_id = ?")
+    .bind(userId, biz.id)
+    .first<{ sync_token: string }>();
+  expect(afterRun?.sync_token).toBe("biz-token-1");
+}, 15000);
+
 it("a genuine race between two concurrent runFullSync calls only lets one proceed", async () => {
   const userId = await createTestUser();
   await createTestAccount(userId, "primary", { email: "me@example.com", accessToken: "tok-primary" });
