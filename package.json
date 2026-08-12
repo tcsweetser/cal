@@ -13,7 +13,8 @@
     "cf-typegen": "wrangler types",
     "db:migrate:local": "wrangler d1 migrations apply DB --local",
     "db:migrate:remote": "wrangler d1 migrations apply DB --remote",
-    "test": "vitest run"
+    "test": "vitest run",
+    "provision": "node scripts/provision-cloudflare.js"
   },
   "dependencies": {
     "hono": "^4.6.0"
