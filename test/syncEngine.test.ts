@@ -498,6 +498,74 @@ it("a backlog larger than one invocation's call budget drains across two runs wi
   expect(afterRun?.sync_token).toBe("biz-token-1");
 }, 15000);
 
+it("an incremental delta with a far-future recurring event doesn't queue it, but still deletes a far-future cancellation", async () => {
+  const userId = await createTestUser();
+  await createTestAccount(userId, "primary", { email: "me@example.com", accessToken: "tok-primary" });
+  const biz = await createTestAccount(userId, "secondary", {
+    email: "biz@example.com",
+    tag: "business",
+    accessToken: "tok-biz",
+  });
+
+  // Round 1: establish a real syncToken (empty delta) — this is what puts
+  // the account on the incremental path for round 2, the case Google won't
+  // let us bound with timeMax at all (mutually exclusive with syncToken).
+  mock.queueList("tok-biz", { events: [], nextSyncToken: "biz-token-1" });
+  await runFullSync(env, userId);
+
+  const farFuture = new Date(Date.now() + 400 * 24 * 60 * 60 * 1000).toISOString(); // ~13 months out
+  const nearTerm = new Date(Date.now() + 60 * 60 * 1000).toISOString(); // 1 hour out
+
+  // Round 2: incremental delta reports a newly-created indefinitely-recurring
+  // event's expanded occurrence far outside the 30-day window, alongside a
+  // normal near-term event — simulating exactly what exposed the bug (a
+  // weekly series with no end date, picked up via syncToken with no bound).
+  mock.queueList("tok-biz", {
+    events: [
+      {
+        id: "ev-far-future",
+        status: "confirmed",
+        transparency: "opaque",
+        start: { dateTime: farFuture },
+        end: { dateTime: farFuture },
+      },
+      {
+        id: "ev-near-term",
+        status: "confirmed",
+        transparency: "opaque",
+        start: { dateTime: nearTerm },
+        end: { dateTime: nearTerm },
+      },
+    ],
+    nextSyncToken: "biz-token-2",
+  });
+  await runFullSync(env, userId);
+
+  // Only the near-term event replicated — the far-future one was filtered
+  // before ever reaching the queue, not just left unprocessed.
+  expect(await findEventMappingsBySource(env.DB, biz.id, "ev-near-term")).toHaveLength(1);
+  expect(await findEventMappingsBySource(env.DB, biz.id, "ev-far-future")).toHaveLength(0);
+  const queued = await env.DB.prepare("SELECT event_id FROM sync_queue WHERE account_id = ?")
+    .bind(biz.id)
+    .all<{ event_id: string }>();
+  expect(queued.results.map((r) => r.event_id)).not.toContain("ev-far-future");
+
+  // Round 3: that far-future event gets cancelled before ever being synced.
+  // Cancellations must never be dropped by the window filter — if a replica
+  // had existed (e.g. created before this fix shipped), losing the
+  // cancellation here would orphan it on every target calendar forever.
+  mock.queueList("tok-biz", {
+    events: [{ id: "ev-far-future", status: "cancelled" }],
+    nextSyncToken: "biz-token-3",
+  });
+  await runFullSync(env, userId);
+
+  const log = await env.DB.prepare("SELECT status FROM sync_logs WHERE user_id = ? ORDER BY created_at DESC LIMIT 1")
+    .bind(userId)
+    .first<{ status: string }>();
+  expect(log?.status).toBe("success"); // the cancellation was processed cleanly, not silently skipped
+});
+
 it("a genuine race between two concurrent runFullSync calls only lets one proceed", async () => {
   const userId = await createTestUser();
   await createTestAccount(userId, "primary", { email: "me@example.com", accessToken: "tok-primary" });

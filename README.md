@@ -4,7 +4,7 @@ Open-source, edge-deployed system that keeps multiple Google Calendar accounts (
 
 ## Status
 
-✅ **Feature-complete (Phase 6 of 6).** Skeleton, DB schema, Google OAuth + encrypted token storage + sessions, the sync engine and cron handler, and the dashboard are all built and verified. A fresh `git clone` of this repo (`npm install` → apply the migration → `npm test` → `wrangler dev`) has been confirmed to work end to end, including the full redirect chain from `/` through to Google's real OAuth consent screen. The one thing not exercised in this development environment is an actual Google OAuth consent-screen *grant* (no real Google Cloud Console credentials available here) — everything before and after that one step is verified against real local infrastructure. See `task_plan.md` for exactly what's been tested at each phase.
+✅ **Feature-complete and deployed in production.** Skeleton, DB schema, Google OAuth + encrypted token storage + sessions, the sync engine and cron handler, and the dashboard are all built, verified, and running live against 5 real Google accounts (1 primary + 4 secondary), replicating real events end to end — including creates, deletes/cancellations, and recurring events. See `task_plan.md` for the full build and incident history, including two production issues found and fixed after the initial deploy (a Workers subrequest-limit overrun on first full sync, and an unbounded incremental-sync gap for indefinitely-recurring events).
 
 Full implementation plan and progress tracking: [`task_plan.md`](task_plan.md).
 
@@ -17,6 +17,7 @@ Full implementation plan and progress tracking: [`task_plan.md`](task_plan.md).
   - Secondary → every other Secondary: replicated as `"Busy"`
 - Replicated events strip all identifying detail (no title, description, attendees, or location) — only free/busy status crosses calendars.
 - A background sync runs on a 10-minute Cron Trigger; deletions and edits (including flipping an event from busy to free) propagate automatically.
+- **Sync window**: only events starting within a rolling 30-day window (now → now+30d) are replicated. This keeps each sync run within Cloudflare Workers' external-subrequest limit regardless of calendar size — see `task_plan.md` for the incident that made this necessary (an indefinitely-recurring event with no bound expanded to hundreds of occurrences in one sync). A practical consequence: occurrences of a recurring series more than 30 days out are not proactively replicated ahead of time; they enter the sync window as time passes. Cancellations are never subject to this window — a stale replica is always cleaned up regardless of how far out it would have been.
 - Full design detail, including the data model and the loop-prevention mechanism, is in [`plan.md`](plan.md); the original build spec is in [`claude_code_prompt.md`](claude_code_prompt.md).
 
 ## Dashboard

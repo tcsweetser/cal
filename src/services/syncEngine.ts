@@ -105,6 +105,33 @@ function isReplica(event: GoogleCalendarEvent): boolean {
   return event.extendedProperties?.private?.syncEngine === "cf-cal-replication";
 }
 
+function eventStartMs(event: GoogleCalendarEvent): number | null {
+  const start = event.start?.dateTime ?? event.start?.date;
+  if (!start) return null;
+  const ms = new Date(start).getTime();
+  return Number.isNaN(ms) ? null : ms;
+}
+
+// Google's Calendar API rejects timeMin/timeMax combined with syncToken (they
+// are mutually exclusive request parameters) — so the timeMax bound passed to
+// fetchEventsDelta on the initial/full-resync fetch does nothing for the
+// steady-state incremental (syncToken) fetch, which is what every account
+// uses after its first successful sync. Creating a new indefinitely-recurring
+// event and letting it come through as an incremental delta is exactly what
+// exposed this: with singleEvents=true and no time bound at all, Google fully
+// expanded a single weekly series with no end date out to its own internal
+// horizon (~2040), queuing 700+ events from one account (see task_plan.md).
+// This filter is the real enforcement point — applied uniformly to whatever
+// fetchEventsDelta returns, regardless of which path produced it, so the
+// window is actually respected rather than only requested. Cancellations are
+// exempt: a stale replica needs deleting no matter how far out it would have
+// been, and dropping the cancellation here would leave it orphaned forever.
+function withinSyncWindow(event: GoogleCalendarEvent, windowEndMs: number): boolean {
+  if (event.status === "cancelled") return true;
+  const startMs = eventStartMs(event);
+  return startMs === null || startMs <= windowEndMs;
+}
+
 function errMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
@@ -322,15 +349,17 @@ async function syncAccount(
     // unless they're repeating past the current date and time."
     const timeMin = new Date().toISOString();
     // Bounding the future side matters just as much: with singleEvents=true,
-    // an indefinitely-recurring series with no end date expands into one
-    // item per occurrence with no inherent cap — in production this queued
-    // 4,355 events from a single account before this bound existed (see
-    // task_plan.md). A rolling window is enough for this app's actual job
-    // (avoiding double-booking near-term), and doesn't need active
-    // maintenance to "roll forward": Google syncTokens naturally expire
-    // periodically, and the existing SyncTokenExpiredError → full-resync path
-    // re-establishes a fresh now-relative window each time that happens.
-    const timeMax = new Date(Date.now() + FUTURE_WINDOW_MS).toISOString();
+    // an indefinitely-recurring series with no end date expands into one item
+    // per occurrence with no inherent cap — in production this queued 4,355
+    // events from a single account before this bound existed (see
+    // task_plan.md). Only takes effect on this initial/full-resync fetch,
+    // though — Google rejects timeMax combined with syncToken, so the
+    // incremental (steady-state) path below has no server-side bound at all.
+    // withinSyncWindow (used just below, after the fetch) is the real
+    // enforcement point for that path — this timeMax is a courtesy that saves
+    // a round trip when it does apply, not something to rely on alone.
+    const windowEndMs = Date.now() + FUTURE_WINDOW_MS;
+    const timeMax = new Date(windowEndMs).toISOString();
 
     let result: EventsDeltaResult;
     let recovered = false;
@@ -354,11 +383,15 @@ async function syncAccount(
     }
 
     // Replica events themselves are filtered out here (not worth queuing —
-    // isReplica is a pure local check, no API call either way). Everything
-    // else — including cancellations and now-free events — goes through the
-    // same queue so the drain loop below has one code path for all of it.
+    // isReplica is a pure local check, no API call either way), as are
+    // confirmed/tentative events starting beyond the rolling window (see
+    // withinSyncWindow — the real enforcement point given Google won't bound
+    // the incremental/syncToken path itself). Everything else — including
+    // cancellations and now-free events — goes through the same queue so the
+    // drain loop below has one code path for all of it.
     const toQueue = result.events
       .filter((event) => !isReplica(event))
+      .filter((event) => withinSyncWindow(event, windowEndMs))
       .map((event) => ({ id: event.id, json: JSON.stringify(event) }));
     await enqueueEvents(env.DB, userId, account.id, toQueue);
     await setPendingSyncToken(env.DB, userId, account.id, result.nextSyncToken);
