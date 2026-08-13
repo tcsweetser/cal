@@ -56,3 +56,7 @@ No secrets are ever committed to this repository. Local development secrets live
 ## License
 
 [PolyForm Noncommercial License 1.0.0](LICENSE) — free for noncommercial use. Commercial use is not licensed by these terms; contact the licensor (see [LICENSE](LICENSE)) to discuss commercial terms.
+
+## Support
+
+Built and maintained by [Terry Sweetser](https://github.com/tcsweetser). If this project is useful to you, consider [buying me a coffee](https://buymeacoffee.com/terrysweetser) — or [hire me](https://github.com/IEISI-ORG).
