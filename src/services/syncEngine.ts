@@ -44,7 +44,7 @@ const STALE_LOCK_MS = 15 * 60 * 1000;
 
 // How far into the future an initial/full sync fetches. See the comment at
 // its use in syncAccount for why this exists at all.
-const FUTURE_WINDOW_MS = 30 * 24 * 60 * 60 * 1000;
+const FUTURE_WINDOW_MS = 42 * 24 * 60 * 60 * 1000;
 
 // Workers Free plan caps external subrequests at 50 per invocation (Paid:
 // 10,000+). One full sync's Google Calendar writes (up to one insert/patch
@@ -149,8 +149,9 @@ function eventEndMs(event: GoogleCalendarEvent): number | null {
 // so a same-day all-day event's start already reads as "before now" for any
 // time after 00:00 — checking its (exclusive) end instead correctly keeps it
 // in scope for its entire day. The upper bound stays start-based deliberately
-// — an event that starts 29 days out with a 2-hour duration should still
-// count as "within the next 30 days," not be judged by when it finishes.
+// — an event that starts near the far edge of the window with a 2-hour
+// duration should still count as "within FUTURE_WINDOW_MS," not be judged by
+// when it finishes.
 function withinSyncWindow(event: GoogleCalendarEvent, windowStartMs: number, windowEndMs: number): boolean {
   if (event.status === "cancelled") return true;
   const startMs = eventStartMs(event);
@@ -564,8 +565,9 @@ const MAX_DAILY_AUDIT_CALLS = 15;
 
 // Closes the gap left by the incremental (syncToken) sync path: an unedited
 // recurring series never generates a new delta, so nothing ever notices when
-// one of its occurrences rolls into the 30-day window as "now" advances (see
-// task_plan.md, and the migration comment on tracked_recurring_series). This
+// one of its occurrences rolls into the sync window (FUTURE_WINDOW_MS) as
+// "now" advances (see task_plan.md, and the migration comment on
+// tracked_recurring_series). This
 // runs once a day (gated by a KV timestamp in index.ts, not a second cron
 // trigger — Cloudflare accounts have a small fixed cron-trigger budget, not
 // worth spending a second one on this). For each series whose covered_through

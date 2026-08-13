@@ -509,6 +509,46 @@ it("a backlog larger than one invocation's call budget drains across two runs wi
   expect(afterRun?.sync_token).toBe("biz-token-1");
 }, 15000);
 
+it("the sync window's far edge is 42 days, not 30 — an event just past the old boundary now queues, one past the new boundary still doesn't", async () => {
+  const userId = await createTestUser();
+  await createTestAccount(userId, "primary", { email: "me@example.com", accessToken: "tok-primary" });
+  const biz = await createTestAccount(userId, "secondary", {
+    email: "biz@example.com",
+    tag: "business",
+    accessToken: "tok-biz",
+  });
+
+  mock.queueList("tok-biz", { events: [], nextSyncToken: "biz-token-1" });
+  await runFullSync(env, userId); // establish a real syncToken, putting the account on the incremental path
+
+  const withinNewWindow = new Date(Date.now() + 35 * 24 * 60 * 60 * 1000).toISOString(); // 35d: > old 30d edge, < new 42d edge
+  const beyondNewWindow = new Date(Date.now() + 45 * 24 * 60 * 60 * 1000).toISOString(); // 45d: past even the new edge
+
+  mock.queueList("tok-biz", {
+    events: [
+      {
+        id: "ev-35-days-out",
+        status: "confirmed",
+        transparency: "opaque",
+        start: { dateTime: withinNewWindow },
+        end: { dateTime: withinNewWindow },
+      },
+      {
+        id: "ev-45-days-out",
+        status: "confirmed",
+        transparency: "opaque",
+        start: { dateTime: beyondNewWindow },
+        end: { dateTime: beyondNewWindow },
+      },
+    ],
+    nextSyncToken: "biz-token-2",
+  });
+  await runFullSync(env, userId);
+
+  expect(await findEventMappingsBySource(env.DB, biz.id, "ev-35-days-out")).not.toHaveLength(0); // now in scope
+  expect(await findEventMappingsBySource(env.DB, biz.id, "ev-45-days-out")).toHaveLength(0); // still out of scope
+});
+
 it("an incremental delta with a far-future recurring event doesn't queue it, but still deletes a far-future cancellation", async () => {
   const userId = await createTestUser();
   await createTestAccount(userId, "primary", { email: "me@example.com", accessToken: "tok-primary" });
@@ -528,7 +568,7 @@ it("an incremental delta with a far-future recurring event doesn't queue it, but
   const nearTerm = new Date(Date.now() + 60 * 60 * 1000).toISOString(); // 1 hour out
 
   // Round 2: incremental delta reports a newly-created indefinitely-recurring
-  // event's expanded occurrence far outside the 30-day window, alongside a
+  // event's expanded occurrence far outside the sync window, alongside a
   // normal near-term event — simulating exactly what exposed the bug (a
   // weekly series with no end date, picked up via syncToken with no bound).
   mock.queueList("tok-biz", {
@@ -725,7 +765,11 @@ it("the daily recurring audit skips a series whose covered_through is already ca
     accessToken: "tok-biz",
   });
 
-  const wellAhead = new Date(Date.now() + 40 * 24 * 60 * 60 * 1000).toISOString(); // already past today+30d
+  // Comfortably beyond FUTURE_WINDOW_MS regardless of its exact value — a
+  // fixture tied to the specific window size (e.g. "40 days," true only when
+  // the window was 30) breaks the moment that constant changes, the same
+  // fragility class as the once-hardcoded test dates elsewhere in this file.
+  const wellAhead = new Date(Date.now() + 200 * 24 * 60 * 60 * 1000).toISOString();
   await env.DB.prepare(
     "INSERT INTO tracked_recurring_series (user_id, account_id, recurring_event_id, covered_through) VALUES (?, ?, ?, ?)",
   )

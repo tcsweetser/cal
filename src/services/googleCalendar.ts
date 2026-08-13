@@ -126,8 +126,8 @@ export async function fetchEventsDelta(
 }
 
 // Used only by the daily recurring-series audit (syncEngine.ts) to look
-// ahead for occurrences of a known series that have newly entered the
-// 30-day window. Deliberately a separate endpoint from fetchEventsDelta:
+// ahead for occurrences of a known series that have newly entered the sync
+// window (see FUTURE_WINDOW_MS). Deliberately a separate endpoint from fetchEventsDelta:
 // events.instances() takes timeMin/timeMax directly with no syncToken
 // involved at all, so none of the incremental-sync bounding restrictions
 // that motivated this function's existence apply to it — this is the one
