@@ -1,7 +1,7 @@
 import { env } from "cloudflare:workers";
 import { it, expect, beforeEach } from "vitest";
 import { runFullSync, runDailyRecurringAudit } from "../src/services/syncEngine";
-import { findEventMappingsBySource } from "../src/db/schema";
+import { findEventMappingsBySource, createEventMapping } from "../src/db/schema";
 import { GoogleCalendarMock } from "./helpers/googleMock";
 import { createTestUser, createTestAccount } from "./helpers/fixtures";
 
@@ -823,4 +823,91 @@ it("a normal sync only tracks a series on its first sighting, never overwriting 
     .bind(biz.id, "series-already-tracked")
     .first<{ covered_through: string }>();
   expect(row?.covered_through).toBe(advancedFar); // untouched, not reset
+});
+
+it("the tracked_recurring_series backfill (migration 0004) correctly parses both instance-id formats from pre-existing event_mappings", async () => {
+  const userId = await createTestUser();
+  const primary = await createTestAccount(userId, "primary", { email: "me@example.com", accessToken: "tok-primary" });
+  const biz = await createTestAccount(userId, "secondary", {
+    email: "biz@example.com",
+    tag: "business",
+    accessToken: "tok-biz",
+  });
+
+  // Simulates data left behind by pre-existing recurring series that were
+  // fully synced before the daily-audit feature (and this backfill) existed
+  // — exactly the state that caused the real production gap this migration
+  // fixes. Both of Google's actual instance-id formats are covered: timed
+  // ("<masterId>_<YYYYMMDDTHHMMSSZ>") and all-day ("<masterId>_<YYYYMMDD>").
+  await createEventMapping(env.DB, {
+    id: crypto.randomUUID(),
+    userId,
+    sourceAccountId: biz.id,
+    sourceEventId: "timedseries123_20260814T030000Z",
+    targetAccountId: primary.id,
+    targetEventId: "replica-1",
+  });
+  await createEventMapping(env.DB, {
+    id: crypto.randomUUID(),
+    userId,
+    sourceAccountId: biz.id,
+    sourceEventId: "alldayseries456_20260814",
+    targetAccountId: primary.id,
+    targetEventId: "replica-2",
+  });
+  // A genuinely non-recurring event's mapping must NOT be misparsed into a
+  // phantom tracked series — Google's real event ids don't contain
+  // underscores, but confirming the negative case guards against a GLOB
+  // pattern that's accidentally too permissive.
+  await createEventMapping(env.DB, {
+    id: crypto.randomUUID(),
+    userId,
+    sourceAccountId: biz.id,
+    sourceEventId: "oneoffevent789",
+    targetAccountId: primary.id,
+    targetEventId: "replica-3",
+  });
+
+  // Duplicated from migrations/0004_backfill_tracked_recurring_series.sql —
+  // the migration itself already ran (as a no-op, before any event_mappings
+  // existed) during test-environment setup, so this re-executes the same
+  // logic directly against the fixtures just inserted above. Keep in sync
+  // with the migration file if this query ever changes. .prepare().run(),
+  // not .exec() — D1's exec() splits input on newlines, which breaks a
+  // multi-line CTE; prepare() treats the whole string as one statement.
+  await env.DB.prepare(
+    `WITH extracted AS (
+        SELECT DISTINCT
+            em.user_id,
+            em.source_account_id AS account_id,
+            CASE
+                WHEN length(em.source_event_id) > 17
+                    AND substr(em.source_event_id, length(em.source_event_id) - 16, 1) = '_'
+                    AND substr(em.source_event_id, length(em.source_event_id) - 15, 8) NOT GLOB '*[^0-9]*'
+                    AND substr(em.source_event_id, length(em.source_event_id) - 7, 1) = 'T'
+                    AND substr(em.source_event_id, length(em.source_event_id) - 6, 6) NOT GLOB '*[^0-9]*'
+                    AND substr(em.source_event_id, length(em.source_event_id), 1) = 'Z'
+                    THEN substr(em.source_event_id, 1, length(em.source_event_id) - 17)
+                WHEN length(em.source_event_id) > 9
+                    AND substr(em.source_event_id, length(em.source_event_id) - 8, 1) = '_'
+                    AND substr(em.source_event_id, length(em.source_event_id) - 7, 8) NOT GLOB '*[^0-9]*'
+                    THEN substr(em.source_event_id, 1, length(em.source_event_id) - 9)
+                ELSE NULL
+            END AS recurring_event_id
+        FROM event_mappings em
+    )
+    INSERT INTO tracked_recurring_series (user_id, account_id, recurring_event_id, covered_through)
+    SELECT user_id, account_id, recurring_event_id, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+    FROM extracted
+    WHERE recurring_event_id IS NOT NULL
+    ON CONFLICT (account_id, recurring_event_id) DO NOTHING`,
+  ).run();
+
+  const { results } = await env.DB.prepare("SELECT recurring_event_id FROM tracked_recurring_series WHERE account_id = ?")
+    .bind(biz.id)
+    .all<{ recurring_event_id: string }>();
+  const trackedIds = results.map((r) => r.recurring_event_id).sort();
+
+  expect(trackedIds).toEqual(["alldayseries456", "timedseries123"]); // both formats correctly parsed
+  expect(trackedIds).not.toContain("oneoffevent789"); // non-recurring event never misidentified as a series
 });
