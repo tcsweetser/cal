@@ -1,9 +1,9 @@
 #!/usr/bin/env node
 // Idempotent setup helper: finds-or-creates the KV namespace and D1 database
-// this Worker needs, by name, then prints the wrangler.jsonc values to paste
-// in. Point it at ANY Cloudflare account via standard API auth — lets a
+// this Worker needs, by name, then prints the wrangler.local.jsonc values to
+// paste in. Point it at ANY Cloudflare account via standard API auth — lets a
 // deployer reuse existing resources (by name) instead of always creating
-// fresh ones, without hand-editing wrangler.jsonc through the dashboard.
+// fresh ones, without hand-editing wrangler.local.jsonc through the dashboard.
 //
 // Usage:
 //   CLOUDFLARE_API_TOKEN=... CLOUDFLARE_ACCOUNT_ID=... node scripts/provision-cloudflare.js
@@ -112,10 +112,12 @@ const d1Id = await findOrCreateD1Database(D1_NAME);
 if (DRY_RUN) {
   console.log("\nDry run complete — nothing was created or modified. Re-run without --dry-run to provision for real.");
 } else {
-  console.log("\nPaste these values into wrangler.jsonc:\n");
+  console.log("\nPaste these values into wrangler.local.jsonc (copy wrangler.jsonc to that gitignored");
+  console.log("file first if you haven't already — never put real resource IDs in wrangler.jsonc itself,");
+  console.log("it stays a placeholder template so it's always safe to commit):\n");
   console.log(`  kv_namespaces[0].id            = "${kvId}"`);
   console.log(`  d1_databases[0].database_id    = "${d1Id}"`);
   console.log(`  d1_databases[0].database_name  = "${D1_NAME}"`);
   console.log(`\nOptionally, account_id (top level, not required if you only ever deploy from an account with one Cloudflare account): "${ACCOUNT_ID}"`);
-  console.log("\nThen: npm run db:migrate:remote && npx wrangler deploy");
+  console.log("\nThen: npx wrangler d1 migrations apply DB --remote -c wrangler.local.jsonc && npx wrangler deploy -c wrangler.local.jsonc");
 }
