@@ -10,6 +10,17 @@ function originEventIdOf(body: Record<string, unknown>): string | undefined {
   return props?.private?.originEventId;
 }
 
+// Relative to test-run time, not hardcoded — syncAccount's withinSyncWindow
+// filter (syncEngine.ts) rejects events outside [now, now+30d], so a fixture
+// with a hardcoded absolute date silently starts failing the moment the real
+// calendar date passes it. Every "near-term" test event uses these instead.
+function hoursFromNow(h: number): string {
+  return new Date(Date.now() + h * 60 * 60 * 1000).toISOString();
+}
+function dateDaysFromNow(d: number): string {
+  return new Date(Date.now() + d * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+}
+
 let mock: GoogleCalendarMock;
 
 beforeEach(() => {
@@ -37,8 +48,8 @@ it("secondary event fans out to primary and every other secondary, never to itse
         id: "ev1",
         status: "confirmed",
         transparency: "opaque",
-        start: { dateTime: "2026-08-12T10:00:00Z" },
-        end: { dateTime: "2026-08-12T11:00:00Z" },
+        start: { dateTime: hoursFromNow(2) },
+        end: { dateTime: hoursFromNow(3) },
       },
     ],
     nextSyncToken: "biz-token-1",
@@ -79,8 +90,8 @@ it("primary event fans out to every secondary as Personal Time", async () => {
         id: "ev-p1",
         status: "confirmed",
         transparency: "opaque",
-        start: { date: "2026-08-12" },
-        end: { date: "2026-08-13" },
+        start: { date: dateDaysFromNow(0) },
+        end: { date: dateDaysFromNow(1) },
       },
     ],
     nextSyncToken: "primary-token-1",
@@ -107,8 +118,8 @@ it("a previously-synced event is PATCHed on the next sync, not duplicated", asyn
     id: "ev1",
     status: "confirmed" as const,
     transparency: "opaque" as const,
-    start: { dateTime: "2026-08-12T10:00:00Z" },
-    end: { dateTime: "2026-08-12T11:00:00Z" },
+    start: { dateTime: hoursFromNow(2) },
+    end: { dateTime: hoursFromNow(3) },
   };
 
   mock.queueList("tok-biz", { events: [nativeEvent], nextSyncToken: "biz-token-1" });
@@ -120,7 +131,7 @@ it("a previously-synced event is PATCHed on the next sync, not duplicated", asyn
 
   // Second sync: same event id, changed time, still native (no extendedProperties).
   mock.queueList("tok-biz", {
-    events: [{ ...nativeEvent, start: { dateTime: "2026-08-12T14:00:00Z" }, end: { dateTime: "2026-08-12T15:00:00Z" } }],
+    events: [{ ...nativeEvent, start: { dateTime: hoursFromNow(6) }, end: { dateTime: hoursFromNow(7) } }],
     nextSyncToken: "biz-token-2",
   });
   await runFullSync(env, userId);
@@ -154,8 +165,8 @@ it("cancelling a source event deletes every mapped replica, not just one", async
         id: "ev1",
         status: "confirmed",
         transparency: "opaque",
-        start: { dateTime: "2026-08-12T10:00:00Z" },
-        end: { dateTime: "2026-08-12T11:00:00Z" },
+        start: { dateTime: hoursFromNow(2) },
+        end: { dateTime: hoursFromNow(3) },
       },
     ],
     nextSyncToken: "biz-token-1",
@@ -193,8 +204,8 @@ it("a replica appearing in a source account's own delta is never relayed further
         id: "ev-p1",
         status: "confirmed",
         transparency: "opaque",
-        start: { dateTime: "2026-08-12T10:00:00Z" },
-        end: { dateTime: "2026-08-12T11:00:00Z" },
+        start: { dateTime: hoursFromNow(2) },
+        end: { dateTime: hoursFromNow(3) },
       },
     ],
     nextSyncToken: "primary-token-1",
@@ -213,8 +224,8 @@ it("a replica appearing in a source account's own delta is never relayed further
         id: "replica-on-biz",
         status: "confirmed",
         transparency: "opaque",
-        start: { dateTime: "2026-08-12T10:00:00Z" },
-        end: { dateTime: "2026-08-12T11:00:00Z" },
+        start: { dateTime: hoursFromNow(2) },
+        end: { dateTime: hoursFromNow(3) },
         extendedProperties: {
           private: {
             syncEngine: "cf-cal-replication",
@@ -256,8 +267,8 @@ it("a 410 Gone response wipes the stored syncToken and falls back to a full re-s
         id: "ev-recovered",
         status: "confirmed",
         transparency: "opaque",
-        start: { dateTime: "2026-08-12T10:00:00Z" },
-        end: { dateTime: "2026-08-12T11:00:00Z" },
+        start: { dateTime: hoursFromNow(2) },
+        end: { dateTime: hoursFromNow(3) },
       },
     ],
     nextSyncToken: "biz-token-fresh",
@@ -318,8 +329,8 @@ it("a replica deleted by hand (PATCH 404) is re-created instead of wedging the a
     id: "ev1",
     status: "confirmed" as const,
     transparency: "opaque" as const,
-    start: { dateTime: "2026-08-12T10:00:00Z" },
-    end: { dateTime: "2026-08-12T11:00:00Z" },
+    start: { dateTime: hoursFromNow(2) },
+    end: { dateTime: hoursFromNow(3) },
   };
 
   mock.queueList("tok-biz", { events: [nativeEvent], nextSyncToken: "biz-token-1" });
@@ -360,15 +371,15 @@ it("one event that can never be inserted doesn't block the rest of the delta or 
         id: "ev-poison",
         status: "confirmed",
         transparency: "opaque",
-        start: { dateTime: "2026-08-12T09:00:00Z" },
-        end: { dateTime: "2026-08-12T09:30:00Z" },
+        start: { dateTime: hoursFromNow(1) },
+        end: { dateTime: hoursFromNow(1.5) },
       },
       {
         id: "ev-good",
         status: "confirmed",
         transparency: "opaque",
-        start: { dateTime: "2026-08-12T10:00:00Z" },
-        end: { dateTime: "2026-08-12T11:00:00Z" },
+        start: { dateTime: hoursFromNow(2) },
+        end: { dateTime: hoursFromNow(3) },
       },
     ],
     nextSyncToken: "biz-token-1",
@@ -414,8 +425,8 @@ it("410 recovery reconciles pre-existing mappings, removing replicas for events 
         id: "ev-will-vanish",
         status: "confirmed",
         transparency: "opaque",
-        start: { dateTime: "2026-08-12T10:00:00Z" },
-        end: { dateTime: "2026-08-12T11:00:00Z" },
+        start: { dateTime: hoursFromNow(2) },
+        end: { dateTime: hoursFromNow(3) },
       },
     ],
     nextSyncToken: "biz-token-1",
@@ -452,8 +463,8 @@ it("a backlog larger than one invocation's call budget drains across two runs wi
     id: `ev-${i}`,
     status: "confirmed" as const,
     transparency: "opaque" as const,
-    start: { dateTime: "2026-08-12T10:00:00Z" },
-    end: { dateTime: "2026-08-12T11:00:00Z" },
+    start: { dateTime: hoursFromNow(2) },
+    end: { dateTime: hoursFromNow(3) },
   }));
   mock.queueList("tok-biz", { events, nextSyncToken: "biz-token-1" });
 
@@ -556,6 +567,76 @@ it("an incremental delta with a far-future recurring event doesn't queue it, but
   // cancellation here would orphan it on every target calendar forever.
   mock.queueList("tok-biz", {
     events: [{ id: "ev-far-future", status: "cancelled" }],
+    nextSyncToken: "biz-token-3",
+  });
+  await runFullSync(env, userId);
+
+  const log = await env.DB.prepare("SELECT status FROM sync_logs WHERE user_id = ? ORDER BY created_at DESC LIMIT 1")
+    .bind(userId)
+    .first<{ status: string }>();
+  expect(log?.status).toBe("success"); // the cancellation was processed cleanly, not silently skipped
+});
+
+it("an incremental delta with a newly-created recurring series' past occurrences doesn't queue them, only the in-window ones", async () => {
+  const userId = await createTestUser();
+  await createTestAccount(userId, "primary", { email: "me@example.com", accessToken: "tok-primary" });
+  const biz = await createTestAccount(userId, "secondary", {
+    email: "biz@example.com",
+    tag: "business",
+    accessToken: "tok-biz",
+  });
+
+  // Round 1: establish a real syncToken, putting the account on the
+  // incremental path — the case Google won't let us bound with timeMin
+  // (or timeMax) at all, since they're mutually exclusive with syncToken.
+  mock.queueList("tok-biz", { events: [], nextSyncToken: "biz-token-1" });
+  await runFullSync(env, userId);
+
+  const farPast = new Date(Date.now() - 300 * 24 * 60 * 60 * 1000).toISOString(); // ~10 months ago
+  const nearTerm = new Date(Date.now() + 60 * 60 * 1000).toISOString(); // 1 hour out
+
+  // Round 2: incremental delta reports a newly-created weekly series whose
+  // start date is months in the past, alongside a normal near-term event —
+  // simulating the exact production incident: Google reports every already-
+  // elapsed occurrence of a brand-new series in one shot, since a delta has
+  // no inherent "don't tell me about the past" behavior of its own.
+  mock.queueList("tok-biz", {
+    events: [
+      {
+        id: "ev-far-past",
+        status: "confirmed",
+        transparency: "opaque",
+        start: { dateTime: farPast },
+        end: { dateTime: farPast },
+      },
+      {
+        id: "ev-near-term",
+        status: "confirmed",
+        transparency: "opaque",
+        start: { dateTime: nearTerm },
+        end: { dateTime: nearTerm },
+      },
+    ],
+    nextSyncToken: "biz-token-2",
+  });
+  await runFullSync(env, userId);
+
+  // Only the near-term event replicated — the past occurrence was filtered
+  // before ever reaching the queue, matching "don't sync past events unless
+  // they're repeating past the current date and time."
+  expect(await findEventMappingsBySource(env.DB, biz.id, "ev-near-term")).toHaveLength(1);
+  expect(await findEventMappingsBySource(env.DB, biz.id, "ev-far-past")).toHaveLength(0);
+  const queued = await env.DB.prepare("SELECT event_id FROM sync_queue WHERE account_id = ?")
+    .bind(biz.id)
+    .all<{ event_id: string }>();
+  expect(queued.results.map((r) => r.event_id)).not.toContain("ev-far-past");
+
+  // Round 3: that far-past event gets cancelled (e.g. the whole series was
+  // deleted) before ever being synced. Cancellations must never be dropped
+  // by the window filter regardless of direction — a stale replica (if one
+  // existed) needs cleaning up no matter how far in the past it would have been.
+  mock.queueList("tok-biz", {
+    events: [{ id: "ev-far-past", status: "cancelled" }],
     nextSyncToken: "biz-token-3",
   });
   await runFullSync(env, userId);

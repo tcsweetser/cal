@@ -112,24 +112,48 @@ function eventStartMs(event: GoogleCalendarEvent): number | null {
   return Number.isNaN(ms) ? null : ms;
 }
 
+function eventEndMs(event: GoogleCalendarEvent): number | null {
+  const end = event.end?.dateTime ?? event.end?.date;
+  if (!end) return null;
+  const ms = new Date(end).getTime();
+  return Number.isNaN(ms) ? null : ms;
+}
+
 // Google's Calendar API rejects timeMin/timeMax combined with syncToken (they
-// are mutually exclusive request parameters) — so the timeMax bound passed to
-// fetchEventsDelta on the initial/full-resync fetch does nothing for the
-// steady-state incremental (syncToken) fetch, which is what every account
-// uses after its first successful sync. Creating a new indefinitely-recurring
-// event and letting it come through as an incremental delta is exactly what
-// exposed this: with singleEvents=true and no time bound at all, Google fully
-// expanded a single weekly series with no end date out to its own internal
-// horizon (~2040), queuing 700+ events from one account (see task_plan.md).
-// This filter is the real enforcement point — applied uniformly to whatever
-// fetchEventsDelta returns, regardless of which path produced it, so the
-// window is actually respected rather than only requested. Cancellations are
-// exempt: a stale replica needs deleting no matter how far out it would have
-// been, and dropping the cancellation here would leave it orphaned forever.
-function withinSyncWindow(event: GoogleCalendarEvent, windowEndMs: number): boolean {
+// are mutually exclusive request parameters) — so the timeMin/timeMax bounds
+// passed to fetchEventsDelta on the initial/full-resync fetch do nothing for
+// the steady-state incremental (syncToken) fetch, which is what every account
+// uses after its first successful sync. Creating a new recurring event and
+// letting it arrive via an incremental delta is exactly what exposed this —
+// first for the future side (an indefinitely-recurring series with no end
+// date expanded to Google's ~2040 horizon, 700+ events from one account), and
+// then, after that fix, for the past side too: a new weekly series anchored
+// to a start date months in the past arrived with all 44 of its past
+// occurrences included, since nothing was bounding the lower edge on the
+// incremental path either (see task_plan.md for both incidents). This filter
+// is the real enforcement point for both bounds — applied uniformly to
+// whatever fetchEventsDelta returns, regardless of which path produced it, so
+// the window is actually respected rather than only requested. Cancellations
+// are exempt from both bounds: a stale replica needs deleting no matter how
+// far out (or how far in the past) it would have been, and dropping the
+// cancellation here would leave it orphaned forever.
+// The lower bound checks END time, not start: an event that started 10
+// minutes ago and runs another 50 isn't a "past event" in any useful sense,
+// it's ongoing and still needs to block calendars — using start here would
+// incorrectly reject anything already in progress. All-day events sharpen
+// this further: Google's date-only start parses as that day's midnight UTC,
+// so a same-day all-day event's start already reads as "before now" for any
+// time after 00:00 — checking its (exclusive) end instead correctly keeps it
+// in scope for its entire day. The upper bound stays start-based deliberately
+// — an event that starts 29 days out with a 2-hour duration should still
+// count as "within the next 30 days," not be judged by when it finishes.
+function withinSyncWindow(event: GoogleCalendarEvent, windowStartMs: number, windowEndMs: number): boolean {
   if (event.status === "cancelled") return true;
   const startMs = eventStartMs(event);
-  return startMs === null || startMs <= windowEndMs;
+  const endMs = eventEndMs(event) ?? startMs;
+  const notYetEnded = endMs === null || endMs >= windowStartMs;
+  const startsInTime = startMs === null || startMs <= windowEndMs;
+  return notYetEnded && startsInTime;
 }
 
 function errMessage(err: unknown): string {
@@ -346,19 +370,23 @@ async function syncAccount(
     // occurrences of a recurring series that started in the past (Google
     // evaluates each occurrence's own time against timeMin), so this excludes
     // only truly-past, non-recurring events, matching "don't sync past events
-    // unless they're repeating past the current date and time."
-    const timeMin = new Date().toISOString();
-    // Bounding the future side matters just as much: with singleEvents=true,
-    // an indefinitely-recurring series with no end date expands into one item
+    // unless they're repeating past the current date and time." Bounding the
+    // future side matters just as much: with singleEvents=true, an
+    // indefinitely-recurring series with no end date expands into one item
     // per occurrence with no inherent cap — in production this queued 4,355
     // events from a single account before this bound existed (see
-    // task_plan.md). Only takes effect on this initial/full-resync fetch,
-    // though — Google rejects timeMax combined with syncToken, so the
-    // incremental (steady-state) path below has no server-side bound at all.
+    // task_plan.md). Both bounds only take effect on this initial/full-resync
+    // fetch, though — Google rejects timeMin/timeMax combined with syncToken,
+    // so the incremental (steady-state) path below has no server-side bound
+    // at all in either direction (proven twice: once for the future side,
+    // then again for the past side when a newly-created series anchored
+    // months back arrived with all its past occurrences intact).
     // withinSyncWindow (used just below, after the fetch) is the real
-    // enforcement point for that path — this timeMax is a courtesy that saves
-    // a round trip when it does apply, not something to rely on alone.
-    const windowEndMs = Date.now() + FUTURE_WINDOW_MS;
+    // enforcement point for both — timeMin/timeMax here are a courtesy that
+    // save a round trip when they do apply, never something to rely on alone.
+    const windowStartMs = Date.now();
+    const windowEndMs = windowStartMs + FUTURE_WINDOW_MS;
+    const timeMin = new Date(windowStartMs).toISOString();
     const timeMax = new Date(windowEndMs).toISOString();
 
     let result: EventsDeltaResult;
@@ -384,14 +412,15 @@ async function syncAccount(
 
     // Replica events themselves are filtered out here (not worth queuing —
     // isReplica is a pure local check, no API call either way), as are
-    // confirmed/tentative events starting beyond the rolling window (see
-    // withinSyncWindow — the real enforcement point given Google won't bound
-    // the incremental/syncToken path itself). Everything else — including
-    // cancellations and now-free events — goes through the same queue so the
-    // drain loop below has one code path for all of it.
+    // confirmed/tentative events starting outside the rolling window in
+    // either direction (see withinSyncWindow — the real enforcement point
+    // given Google won't bound the incremental/syncToken path itself).
+    // Everything else — including cancellations and now-free events — goes
+    // through the same queue so the drain loop below has one code path for
+    // all of it.
     const toQueue = result.events
       .filter((event) => !isReplica(event))
-      .filter((event) => withinSyncWindow(event, windowEndMs))
+      .filter((event) => withinSyncWindow(event, windowStartMs, windowEndMs))
       .map((event) => ({ id: event.id, json: JSON.stringify(event) }));
     await enqueueEvents(env.DB, userId, account.id, toQueue);
     await setPendingSyncToken(env.DB, userId, account.id, result.nextSyncToken);
