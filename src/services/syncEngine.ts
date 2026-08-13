@@ -19,10 +19,14 @@ import {
   deleteQueuedEvent,
   setPendingSyncToken,
   promotePendingSyncToken,
+  trackRecurringSeriesIfNew,
+  listRecurringSeriesNeedingAudit,
+  advanceCoveredThrough,
 } from "../db/schema";
 import { getValidAccessToken, RefreshTokenInvalidError } from "./tokenManager";
 import {
   fetchEventsDelta,
+  fetchRecurringInstances,
   insertEvent,
   patchEvent,
   deleteEvent,
@@ -424,6 +428,17 @@ async function syncAccount(
       .map((event) => ({ id: event.id, json: JSON.stringify(event) }));
     await enqueueEvents(env.DB, userId, account.id, toQueue);
     await setPendingSyncToken(env.DB, userId, account.id, result.nextSyncToken);
+
+    // First-sighting-only tracking (see trackRecurringSeriesIfNew) for the
+    // daily audit's benefit — deliberately over every non-replica event
+    // (including ones withinSyncWindow just filtered out), not just toQueue,
+    // since an occurrence can be the very evidence that a series exists even
+    // when that specific occurrence itself falls outside today's window.
+    for (const event of result.events) {
+      if (!isReplica(event) && event.recurringEventId) {
+        await trackRecurringSeriesIfNew(env.DB, userId, account.id, event.recurringEventId, timeMax);
+      }
+    }
   }
 
   // Drain whatever's queued — what was just staged above, or left over from
@@ -536,5 +551,59 @@ export async function runFullSync(env: Env, userId: string): Promise<void> {
     // Only reachable for failures outside the per-account loop (e.g. listing accounts itself failed).
     await completeSyncLog(env.DB, logId, "error", errMessage(err), totalProcessed);
     throw err;
+  }
+}
+
+// Separate, smaller budget from the main sync's MAX_CALENDAR_API_CALLS_PER_RUN
+// — this runs as an extra step inside the same scheduled() invocation (see
+// index.ts), sharing that invocation's real Workers subrequest ceiling, so it
+// must not compete for the main sync's own allowance. In steady state this
+// audit only spends 1 call per tracked series (each gap is normally a single
+// day wide), so this cap is generous headroom, not a tight constraint.
+const MAX_DAILY_AUDIT_CALLS = 15;
+
+// Closes the gap left by the incremental (syncToken) sync path: an unedited
+// recurring series never generates a new delta, so nothing ever notices when
+// one of its occurrences rolls into the 30-day window as "now" advances (see
+// task_plan.md, and the migration comment on tracked_recurring_series). This
+// runs once a day (gated by a KV timestamp in index.ts, not a second cron
+// trigger — Cloudflare accounts have a small fixed cron-trigger budget, not
+// worth spending a second one on this). For each series whose covered_through
+// has fallen behind today's window edge, looks ahead just the newly-exposed
+// gap via events.instances() (unbounded by the syncToken restriction — see
+// fetchRecurringInstances) and enqueues anything not already queued, reusing
+// the exact same sync_queue/budget/resumability machinery the normal 10-
+// minute sync already relies on, rather than duplicating replication logic
+// here. Deliberately outside runFullSync's per-user sync_logs lock — this
+// touches a different table (tracked_recurring_series) and a disjoint set of
+// API calls, so it can safely run independently without contending for that
+// lock or being mistaken for a stuck sync run.
+export async function runDailyRecurringAudit(env: Env): Promise<void> {
+  const nowMs = Date.now();
+  const windowEndIso = new Date(nowMs + FUTURE_WINDOW_MS).toISOString();
+  const series = await listRecurringSeriesNeedingAudit(env.DB, windowEndIso);
+  if (series.length === 0) return;
+
+  const tokens = new TokenCache(env);
+  const budget = new CallBudget(MAX_DAILY_AUDIT_CALLS);
+
+  for (const row of series) {
+    if (budget.exhausted) break;
+    try {
+      const accessToken = await tokens.get(row.account_id);
+      const instances = await fetchRecurringInstances(accessToken, row.recurring_event_id, row.covered_through, windowEndIso);
+      budget.spend();
+
+      const toQueue = instances
+        .filter((event) => !isReplica(event))
+        .map((event) => ({ id: event.id, json: JSON.stringify(event) }));
+      await enqueueEvents(env.DB, row.user_id, row.account_id, toQueue);
+      await advanceCoveredThrough(env.DB, row.account_id, row.recurring_event_id, windowEndIso);
+    } catch (err) {
+      // One series' failure (revoked token, transient API error) shouldn't
+      // stop the rest of the audit — left with a stale covered_through, so
+      // it's simply retried on the next daily run rather than lost.
+      console.error(`Daily recurring audit failed for series ${row.recurring_event_id}:`, errMessage(err));
+    }
   }
 }

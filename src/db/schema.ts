@@ -299,6 +299,59 @@ export async function promotePendingSyncToken(
     .run();
 }
 
+// --- Recurring series tracking (daily window-gap audit, see task_plan.md) ---
+
+export interface TrackedRecurringSeriesRow {
+  user_id: string;
+  account_id: string;
+  recurring_event_id: string;
+  covered_through: string;
+  created_at: string;
+}
+
+// Only records the FIRST time a series is seen — covered_through is meant to
+// advance solely via advanceCoveredThrough (the daily audit), never here, so
+// this deliberately does nothing on conflict rather than overwriting it.
+export async function trackRecurringSeriesIfNew(
+  db: D1Database,
+  userId: string,
+  accountId: string,
+  recurringEventId: string,
+  coveredThrough: string,
+): Promise<void> {
+  await db
+    .prepare(
+      `INSERT INTO tracked_recurring_series (user_id, account_id, recurring_event_id, covered_through)
+       VALUES (?, ?, ?, ?)
+       ON CONFLICT (account_id, recurring_event_id) DO NOTHING`,
+    )
+    .bind(userId, accountId, recurringEventId, coveredThrough)
+    .run();
+}
+
+export async function listRecurringSeriesNeedingAudit(
+  db: D1Database,
+  windowEndIso: string,
+): Promise<TrackedRecurringSeriesRow[]> {
+  const { results } = await db
+    .prepare("SELECT * FROM tracked_recurring_series WHERE covered_through < ?")
+    .bind(windowEndIso)
+    .all<TrackedRecurringSeriesRow>();
+  return results;
+}
+
+export async function advanceCoveredThrough(
+  db: D1Database,
+  accountId: string,
+  recurringEventId: string,
+  newCoveredThrough: string,
+): Promise<void> {
+  await db
+    .prepare("UPDATE tracked_recurring_series SET covered_through = ? WHERE account_id = ? AND recurring_event_id = ?")
+    .bind(newCoveredThrough, accountId, recurringEventId)
+    .run();
+}
+
 export type SyncLogStatus = "in_progress" | "success" | "error";
 
 export interface SyncLogRow {

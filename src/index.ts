@@ -5,7 +5,15 @@ import dashboardRoutes from "./routes/dashboard";
 import apiRoutes from "./routes/api";
 import publicRoutes from "./routes/public";
 import { listUserIds } from "./db/schema";
-import { runFullSync } from "./services/syncEngine";
+import { runFullSync, runDailyRecurringAudit } from "./services/syncEngine";
+
+// KV key gating the once-a-day recurring-series audit (see syncEngine.ts's
+// runDailyRecurringAudit) — deliberately not a second Cron Trigger, since
+// Cloudflare accounts have a small fixed budget of those. Piggybacks on the
+// existing 10-minute trigger instead: whichever tick is the first to land
+// after this key's date falls behind today's (UTC) date runs the audit once,
+// then updates the key so the rest of the day's ticks skip it.
+const DAILY_AUDIT_KV_KEY = "daily-recurring-audit:last-run-date";
 
 const app = new Hono<AppBindings>();
 
@@ -37,9 +45,33 @@ async function runScheduledSync(env: Env): Promise<void> {
   }
 }
 
+// Runs at most once per UTC calendar day, piggybacked on whichever 10-minute
+// tick happens to be first after midnight — see DAILY_AUDIT_KV_KEY above for
+// why this isn't its own Cron Trigger. The KV write happens before the audit
+// runs, not after: if the audit itself fails partway, it shouldn't retry
+// every 10 minutes for the rest of the day (each tracked series already
+// tolerates a stale covered_through and just retries on the next real daily
+// run — see runDailyRecurringAudit).
+async function maybeRunDailyAudit(env: Env): Promise<void> {
+  const today = new Date().toISOString().slice(0, 10);
+  const lastRun = await env.TOKEN_STORE.get(DAILY_AUDIT_KV_KEY);
+  if (lastRun === today) return;
+  await env.TOKEN_STORE.put(DAILY_AUDIT_KV_KEY, today);
+  try {
+    await runDailyRecurringAudit(env);
+  } catch (err) {
+    console.error("Daily recurring audit failed:", err instanceof Error ? err.message : err);
+  }
+}
+
 export default {
   fetch: app.fetch,
   async scheduled(_controller: ScheduledController, env: Env, ctx: ExecutionContext) {
-    ctx.waitUntil(runScheduledSync(env));
+    ctx.waitUntil(
+      (async () => {
+        await runScheduledSync(env);
+        await maybeRunDailyAudit(env);
+      })(),
+    );
   },
 } satisfies ExportedHandler<Env>;

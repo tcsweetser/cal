@@ -33,6 +33,12 @@ export class GoogleCalendarMock {
   // originEventIds whose insert should always 500 (see the POST handler) —
   // simulates an event that can never be created, for per-event isolation tests.
   private poisonedOriginEventIds = new Set<string>();
+  // What the next events.instances() call for a given (accessToken,
+  // recurringEventId) pair should return — used by the daily recurring
+  // audit's tests (runDailyRecurringAudit, syncEngine.ts). Keyed same as
+  // listQueues but scoped per-series, since a real account can have more
+  // than one tracked series being audited in the same test.
+  private instancesQueues = new Map<string, GoogleCalendarEvent[]>();
   inserts: MockInsert[] = [];
   patches: MockPatch[] = [];
   deletes: MockDelete[] = [];
@@ -42,6 +48,10 @@ export class GoogleCalendarMock {
     const queue = this.listQueues.get(accessToken) ?? [];
     queue.push(response);
     this.listQueues.set(accessToken, queue);
+  }
+
+  queueInstances(accessToken: string, recurringEventId: string, events: GoogleCalendarEvent[]) {
+    this.instancesQueues.set(`${accessToken}:${recurringEventId}`, events);
   }
 
   makeNextPatchGone(eventId: string) {
@@ -92,6 +102,16 @@ export class GoogleCalendarMock {
         this.inserts.push({ accessToken, body });
         const id = `mock-event-${this.nextId++}`;
         return new Response(JSON.stringify({ id, ...body }), { status: 200 });
+      }
+
+      // Checked before the generic patchMatch below — its (.+)$ would
+      // otherwise greedily swallow ".../{id}/instances" as if {id}/instances
+      // were itself an event id.
+      const instancesMatch = url.pathname.match(/^\/calendar\/v3\/calendars\/primary\/events\/([^/]+)\/instances$/);
+      if (instancesMatch && method === "GET") {
+        const recurringEventId = decodeURIComponent(instancesMatch[1]!);
+        const events = this.instancesQueues.get(`${accessToken}:${recurringEventId}`) ?? [];
+        return new Response(JSON.stringify({ items: events }), { status: 200 });
       }
 
       const patchMatch = url.pathname.match(/^\/calendar\/v3\/calendars\/primary\/events\/(.+)$/);

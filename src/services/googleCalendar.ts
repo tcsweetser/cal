@@ -24,6 +24,11 @@ export interface GoogleCalendarEvent {
   extendedProperties?: {
     private?: Record<string, string>;
   };
+  // Present on every expanded instance of a recurring series (singleEvents=
+  // true), pointing at the master event's id — the signal the daily audit
+  // (syncEngine.ts) uses to discover which series exist at all, since we
+  // never otherwise fetch the master event itself.
+  recurringEventId?: string;
 }
 
 export interface EventsDeltaResult {
@@ -118,6 +123,53 @@ export async function fetchEventsDelta(
   }
 
   return { events, nextSyncToken };
+}
+
+// Used only by the daily recurring-series audit (syncEngine.ts) to look
+// ahead for occurrences of a known series that have newly entered the
+// 30-day window. Deliberately a separate endpoint from fetchEventsDelta:
+// events.instances() takes timeMin/timeMax directly with no syncToken
+// involved at all, so none of the incremental-sync bounding restrictions
+// that motivated this function's existence apply to it — this is the one
+// call in the whole app that can genuinely ask Google "what's in this exact
+// date range" without fighting the syncToken-exclusivity rule.
+export async function fetchRecurringInstances(
+  accessToken: string,
+  recurringEventId: string,
+  timeMin: string,
+  timeMax: string,
+): Promise<GoogleCalendarEvent[]> {
+  const events: GoogleCalendarEvent[] = [];
+  let pageToken: string | undefined;
+  let pages = 0;
+
+  do {
+    const params = new URLSearchParams({ timeMin, timeMax, maxResults: "250" });
+    if (pageToken) params.set("pageToken", pageToken);
+
+    const res = await googleFetch(`${EVENTS_URL}/${encodeURIComponent(recurringEventId)}/instances?${params.toString()}`, {
+      headers: { Authorization: `Bearer ${accessToken}` },
+    });
+
+    // The master event (and so its instances) may be gone by the time the
+    // daily audit gets to it — treat like any other "already handled"
+    // gone-ness in this file rather than erroring the whole audit run.
+    if (res.status === 404 || res.status === 410) return events;
+    if (!res.ok) {
+      throw new Error(`Google Calendar instances list failed: ${res.status} ${await res.text()}`);
+    }
+
+    const data = await res.json<EventsListResponse>();
+    events.push(...(data.items ?? []));
+    pageToken = data.nextPageToken;
+
+    pages++;
+    if (pageToken && pages >= MAX_PAGES) {
+      throw new Error(`Google Calendar instances list exceeded ${MAX_PAGES} pages — aborting to stay within Worker limits`);
+    }
+  } while (pageToken);
+
+  return events;
 }
 
 export async function insertEvent(

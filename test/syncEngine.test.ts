@@ -1,6 +1,6 @@
 import { env } from "cloudflare:workers";
 import { it, expect, beforeEach } from "vitest";
-import { runFullSync } from "../src/services/syncEngine";
+import { runFullSync, runDailyRecurringAudit } from "../src/services/syncEngine";
 import { findEventMappingsBySource } from "../src/db/schema";
 import { GoogleCalendarMock } from "./helpers/googleMock";
 import { createTestUser, createTestAccount } from "./helpers/fixtures";
@@ -662,4 +662,121 @@ it("a genuine race between two concurrent runFullSync calls only lets one procee
     .all<{ status: string }>();
   expect(results).toHaveLength(1); // the loser never even inserted a sync_logs row
   expect(results[0]!.status).toBe("success");
+});
+
+it("the daily recurring audit picks up an occurrence the 10-minute sync would never see, and only that gap", async () => {
+  const userId = await createTestUser();
+  await createTestAccount(userId, "primary", { email: "me@example.com", accessToken: "tok-primary" });
+  const biz = await createTestAccount(userId, "secondary", {
+    email: "biz@example.com",
+    tag: "business",
+    accessToken: "tok-biz",
+  });
+
+  // Simulate a series already discovered by a prior normal sync — its
+  // covered_through is stuck a day behind today's window edge, exactly the
+  // state an unedited recurring series is left in forever without this audit.
+  const yesterday = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+  await env.DB.prepare(
+    "INSERT INTO tracked_recurring_series (user_id, account_id, recurring_event_id, covered_through) VALUES (?, ?, ?, ?)",
+  )
+    .bind(userId, biz.id, "series-abc", yesterday)
+    .run();
+
+  // The newly-exposed occurrence — the one thing the incremental (syncToken)
+  // path could never surface on its own, since the series itself never changed.
+  mock.queueInstances("tok-biz", "series-abc", [
+    {
+      id: "series-abc_20260901T100000Z",
+      status: "confirmed",
+      transparency: "opaque",
+      recurringEventId: "series-abc",
+      start: { dateTime: hoursFromNow(500) },
+      end: { dateTime: hoursFromNow(501) },
+    },
+  ]);
+
+  await runDailyRecurringAudit(env);
+
+  // The audit only enqueues — draining (and so replication) happens on the
+  // next normal sync, reusing the exact same machinery as everything else.
+  const queued = await env.DB.prepare("SELECT event_id FROM sync_queue WHERE account_id = ?")
+    .bind(biz.id)
+    .all<{ event_id: string }>();
+  expect(queued.results.map((r) => r.event_id)).toContain("series-abc_20260901T100000Z");
+
+  mock.queueList("tok-biz", { events: [], nextSyncToken: "biz-token-1" }); // nothing new on the normal incremental path
+  await runFullSync(env, userId);
+  expect(await findEventMappingsBySource(env.DB, biz.id, "series-abc_20260901T100000Z")).not.toHaveLength(0);
+
+  // covered_through advanced to today's window edge — the next daily run
+  // won't re-check this same gap again.
+  const row = await env.DB.prepare("SELECT covered_through FROM tracked_recurring_series WHERE account_id = ? AND recurring_event_id = ?")
+    .bind(biz.id, "series-abc")
+    .first<{ covered_through: string }>();
+  expect(new Date(row!.covered_through).getTime()).toBeGreaterThan(new Date(yesterday).getTime());
+});
+
+it("the daily recurring audit skips a series whose covered_through is already caught up, with no API call", async () => {
+  const userId = await createTestUser();
+  const biz = await createTestAccount(userId, "secondary", {
+    email: "biz@example.com",
+    tag: "business",
+    accessToken: "tok-biz",
+  });
+
+  const wellAhead = new Date(Date.now() + 40 * 24 * 60 * 60 * 1000).toISOString(); // already past today+30d
+  await env.DB.prepare(
+    "INSERT INTO tracked_recurring_series (user_id, account_id, recurring_event_id, covered_through) VALUES (?, ?, ?, ?)",
+  )
+    .bind(userId, biz.id, "series-caught-up", wellAhead)
+    .run();
+
+  // Scoped to this series specifically, not "zero calls at all" — D1 state
+  // persists across tests in this file, so an unrelated series tracked by an
+  // earlier test can legitimately still need its own audit call here too.
+  const fetchSpy = mock.install(); // reinstall for a fresh call-count spy
+  await runDailyRecurringAudit(env);
+
+  const calledForThisSeries = fetchSpy.mock.calls.some(([input]) => String(input).includes("series-caught-up"));
+  expect(calledForThisSeries).toBe(false);
+});
+
+it("a normal sync only tracks a series on its first sighting, never overwriting a covered_through the daily audit already advanced", async () => {
+  const userId = await createTestUser();
+  await createTestAccount(userId, "primary", { email: "me@example.com", accessToken: "tok-primary" });
+  const biz = await createTestAccount(userId, "secondary", {
+    email: "biz@example.com",
+    tag: "business",
+    accessToken: "tok-biz",
+  });
+
+  const advancedFar = new Date(Date.now() + 60 * 24 * 60 * 60 * 1000).toISOString();
+  await env.DB.prepare(
+    "INSERT INTO tracked_recurring_series (user_id, account_id, recurring_event_id, covered_through) VALUES (?, ?, ?, ?)",
+  )
+    .bind(userId, biz.id, "series-already-tracked", advancedFar)
+    .run();
+
+  // A normal incremental sync sees ANOTHER occurrence of the same series —
+  // this must not reset covered_through back down to today's window edge.
+  mock.queueList("tok-biz", {
+    events: [
+      {
+        id: "series-already-tracked_20260815T100000Z",
+        status: "confirmed",
+        transparency: "opaque",
+        recurringEventId: "series-already-tracked",
+        start: { dateTime: hoursFromNow(2) },
+        end: { dateTime: hoursFromNow(3) },
+      },
+    ],
+    nextSyncToken: "biz-token-1",
+  });
+  await runFullSync(env, userId);
+
+  const row = await env.DB.prepare("SELECT covered_through FROM tracked_recurring_series WHERE account_id = ? AND recurring_event_id = ?")
+    .bind(biz.id, "series-already-tracked")
+    .first<{ covered_through: string }>();
+  expect(row?.covered_through).toBe(advancedFar); // untouched, not reset
 });
