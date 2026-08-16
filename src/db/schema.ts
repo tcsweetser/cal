@@ -40,6 +40,19 @@ export function findAccountByUserAndEmail(
     .first<AccountRow>();
 }
 
+// Scoped by both id and user_id in one query, rather than fetching by id
+// alone and comparing user_id in application code — the query itself can
+// only ever answer "yes, this account belongs to this user," so a caller
+// can't accidentally skip the ownership check by only looking at part of
+// the result (see trustedAccess.ts's createInvite for why this matters:
+// task_plan.md Phase 7's security model).
+export function findAccountForUser(db: D1Database, userId: string, accountId: string): Promise<AccountRow | null> {
+  return db
+    .prepare("SELECT * FROM accounts WHERE id = ? AND user_id = ?")
+    .bind(accountId, userId)
+    .first<AccountRow>();
+}
+
 export function findPrimaryAccountForUser(db: D1Database, userId: string): Promise<AccountRow | null> {
   return db
     .prepare("SELECT * FROM accounts WHERE user_id = ? AND role = 'primary'")
@@ -484,11 +497,14 @@ export async function listInvitesForUser(db: D1Database, userId: string): Promis
   return results;
 }
 
-// Only transitions a 'pending' invite — a re-verify attempt against an
-// already-verified/used/revoked invite is silently a no-op here, since the
-// caller (trustedAccess.ts) checks status before ever getting this far.
-export async function markInviteVerified(db: D1Database, id: string, verifiedEmail: string): Promise<void> {
-  await db
+// Only transitions a 'pending' invite. Returns whether it actually did, same
+// compare-and-swap shape as tryConsumeInvite below — the caller
+// (trustedAccess.ts) checks this rather than assuming success, after an
+// earlier version silently no-op'd against an already-used/revoked invite
+// while still reporting "verified" to the caller (state drift, caught in
+// this project's post-commit security review, see task_plan.md Phase 7.1).
+export async function markInviteVerified(db: D1Database, id: string, verifiedEmail: string): Promise<boolean> {
+  const result = await db
     .prepare(
       `UPDATE trusted_invites
        SET status = 'verified', verified_email = ?, verified_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
@@ -496,6 +512,7 @@ export async function markInviteVerified(db: D1Database, id: string, verifiedEma
     )
     .bind(verifiedEmail, id)
     .run();
+  return result.meta.changes === 1;
 }
 
 // Atomic compare-and-swap, same pattern as tryStartSyncLog above: only
@@ -537,7 +554,7 @@ export interface EmailVerificationRow {
   created_at: string;
 }
 
-export interface CreateEmailVerificationInput {
+export interface UpsertEmailVerificationInput {
   id: string;
   inviteId: string;
   email: string;
@@ -545,24 +562,52 @@ export interface CreateEmailVerificationInput {
   expiresAt: string;
 }
 
-export async function createEmailVerification(db: D1Database, input: CreateEmailVerificationInput): Promise<void> {
+// UPSERT, not INSERT: at most one row per (invite_id, email) — see the
+// unique index added to migration 0005 and its comment for why. Deliberately
+// leaves `attempts` untouched on conflict (no `attempts = 0` in the DO
+// UPDATE) — a resend must not reset the lockout counter, only the
+// code/expiry, otherwise the 5-attempt cap becomes bypassable by just
+// requesting a new code (the actual bug this fixes).
+export async function upsertEmailVerification(db: D1Database, input: UpsertEmailVerificationInput): Promise<void> {
   await db
-    .prepare("INSERT INTO email_verifications (id, invite_id, email, code_hash, expires_at) VALUES (?, ?, ?, ?, ?)")
+    .prepare(
+      `INSERT INTO email_verifications (id, invite_id, email, code_hash, expires_at)
+       VALUES (?, ?, ?, ?, ?)
+       ON CONFLICT(invite_id, email) DO UPDATE SET
+         code_hash = excluded.code_hash,
+         expires_at = excluded.expires_at,
+         created_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')`,
+    )
     .bind(input.id, input.inviteId, input.email, input.codeHash, input.expiresAt)
     .run();
 }
 
-// Most recent request for this (invite, email) pair — a re-request (e.g. the
-// first code expired before use) should be checked against, not an older one.
-export function findLatestEmailVerification(
+// At most one row per (invite, email) now (see the unique index above), so
+// this is "the" verification for the pair, not "the latest of several".
+export function findEmailVerification(
   db: D1Database,
   inviteId: string,
   email: string,
 ): Promise<EmailVerificationRow | null> {
   return db
-    .prepare("SELECT * FROM email_verifications WHERE invite_id = ? AND email = ? ORDER BY created_at DESC LIMIT 1")
+    .prepare("SELECT * FROM email_verifications WHERE invite_id = ? AND email = ?")
     .bind(inviteId, email)
     .first<EmailVerificationRow>();
+}
+
+// How many distinct email addresses have ever requested a code against this
+// invite — bounds how many different people one invite link can be used to
+// email (see MAX_VERIFICATION_TARGETS_PER_INVITE, trustedAccess.ts). Without
+// this, a single valid invite id could be used to send an unlimited number
+// of "verification code" emails to arbitrary third-party addresses (an open
+// mail-relay / spam-amplification path, caught in this project's post-commit
+// security review — see task_plan.md Phase 7.1).
+export async function countVerificationTargets(db: D1Database, inviteId: string): Promise<number> {
+  const row = await db
+    .prepare("SELECT COUNT(DISTINCT email) AS n FROM email_verifications WHERE invite_id = ?")
+    .bind(inviteId)
+    .first<{ n: number }>();
+  return row?.n ?? 0;
 }
 
 export async function incrementVerificationAttempts(db: D1Database, id: string): Promise<void> {

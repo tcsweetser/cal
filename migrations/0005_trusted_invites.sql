@@ -57,3 +57,12 @@ CREATE TABLE IF NOT EXISTS email_verifications (
 );
 
 CREATE INDEX IF NOT EXISTS idx_email_verifications_invite ON email_verifications(invite_id);
+
+-- At most one row per (invite, email): a resend UPSERTs this row (new code,
+-- new expiry) rather than inserting a fresh one — see upsertEmailVerification
+-- in schema.ts. This is a deliberate security fix, not the original design:
+-- letting every resend insert a brand-new row let `attempts` reset to 0 on
+-- demand, so the 5-attempt lockout in trustedAccess.ts could be bypassed
+-- simply by requesting a new code (caught in this project's post-commit
+-- security review, see task_plan.md Phase 7.1).
+CREATE UNIQUE INDEX IF NOT EXISTS idx_email_verifications_invite_email ON email_verifications(invite_id, email);

@@ -18,10 +18,12 @@ import type { Env } from "../types";
 import {
   createTrustedInvite,
   findTrustedInvite,
+  findAccountForUser,
   markInviteVerified,
   tryConsumeInvite,
-  createEmailVerification,
-  findLatestEmailVerification,
+  upsertEmailVerification,
+  findEmailVerification,
+  countVerificationTargets,
   incrementVerificationAttempts,
   type TrustedInviteKind,
   type TrustedInviteRow,
@@ -33,6 +35,20 @@ const INVITE_TTL_MS: Record<TrustedInviteKind, number> = {
 };
 const VERIFICATION_CODE_TTL_MS = 10 * 60 * 1000;
 const MAX_VERIFICATION_ATTEMPTS = 5;
+// Resending before this elapses is refused — without a cooldown,
+// requestEmailVerification is a free "send one email to any address" call on
+// every invocation, regardless of whether the code is ever guessed.
+const VERIFICATION_RESEND_COOLDOWN_MS = 60 * 1000;
+// Caps how many distinct addresses one invite can ever request a code for.
+// Forwarding a link to a *few* alternate addresses is the intended use case;
+// an unbounded count turns one valid invite id into an open mail relay.
+const MAX_VERIFICATION_TARGETS_PER_INVITE = 5;
+
+const EMAIL_FORMAT_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+function isValidEmailFormat(email: string): boolean {
+  return EMAIL_FORMAT_RE.test(email);
+}
 
 function generateNumericCode(): string {
   // 6 digits, zero-padded. crypto.getRandomValues, not Math.random — this
@@ -40,6 +56,13 @@ function generateNumericCode(): string {
   // state elsewhere in this codebase.
   const n = crypto.getRandomValues(new Uint32Array(1))[0]! % 1_000_000;
   return n.toString().padStart(6, "0");
+}
+
+function isInviteReceivingVerification(invite: TrustedInviteRow, now = Date.now()): boolean {
+  // A code can be requested/confirmed against a 'pending' invite (normal
+  // case) or a 'verified' one (idempotent re-confirm, e.g. a page refresh
+  // before the booking step) — never 'used'/'revoked', and never expired.
+  return (invite.status === "pending" || invite.status === "verified") && Date.parse(invite.expires_at) > now;
 }
 
 export interface CreateInviteInput {
@@ -50,7 +73,28 @@ export interface CreateInviteInput {
   meetingPollId?: string;
 }
 
+// Security model (task_plan.md Phase 7): invite creation is the one place in
+// this whole feature where trust originates — everything downstream (email
+// verification, booking/voting) only ever acts within a grant this function
+// already made, and can never mint a new one. So this checked in depth, not
+// just at the route layer that will call it (Phase 7.2/7.3): the caller
+// supplies userId (expected to come from an authenticated session — routes
+// must never call this without requireAuth having run first) and this
+// function independently re-verifies accountId actually belongs to that
+// user before creating anything, closing the gap where a route bug (or a
+// future call site that forgets the check) could let an authenticated user
+// target an account — and so a calendar — that isn't theirs.
 export async function createInvite(env: Env, input: CreateInviteInput): Promise<string> {
+  if (!isValidEmailFormat(input.inviteeEmail)) {
+    throw new Error(`createInvite: invitee_email is not a valid email address: ${input.inviteeEmail}`);
+  }
+  const account = await findAccountForUser(env.DB, input.userId, input.accountId);
+  if (!account) {
+    throw new Error(`createInvite: account ${input.accountId} does not belong to user ${input.userId}`);
+  }
+  if (account.status !== "active") {
+    throw new Error(`createInvite: account ${input.accountId} is not active (status: ${account.status})`);
+  }
   const id = crypto.randomUUID();
   await createTrustedInvite(env.DB, {
     id,
@@ -83,10 +127,43 @@ export async function sendInviteEmail(
   });
 }
 
-export async function requestEmailVerification(env: Env, inviteId: string, email: string): Promise<void> {
+export type RequestVerificationResult =
+  | { ok: true }
+  | { ok: false; reason: "invite-not-available" | "invalid-email" | "cooldown" | "too-many-targets" };
+
+// Three checks stand between this and being an unauthenticated "email
+// anyone, anytime" relay (all added in this project's post-commit security
+// review — see task_plan.md Phase 7.1): the invite must genuinely exist and
+// be usable (closes sending mail against a garbage/nonexistent id), a resend
+// to the same address is cooldown-limited (closes unlimited free sends to
+// one target), and the number of distinct addresses one invite can ever
+// target is capped (closes unlimited targets from one valid invite).
+export async function requestEmailVerification(
+  env: Env,
+  inviteId: string,
+  email: string,
+): Promise<RequestVerificationResult> {
+  if (!isValidEmailFormat(email)) return { ok: false, reason: "invalid-email" };
+
+  const invite = await findTrustedInvite(env.DB, inviteId);
+  if (!invite || !isInviteReceivingVerification(invite)) {
+    return { ok: false, reason: "invite-not-available" };
+  }
+
+  const existing = await findEmailVerification(env.DB, inviteId, email);
+  if (existing && Date.now() - Date.parse(existing.created_at) < VERIFICATION_RESEND_COOLDOWN_MS) {
+    return { ok: false, reason: "cooldown" };
+  }
+  if (!existing) {
+    const targetCount = await countVerificationTargets(env.DB, inviteId);
+    if (targetCount >= MAX_VERIFICATION_TARGETS_PER_INVITE) {
+      return { ok: false, reason: "too-many-targets" };
+    }
+  }
+
   const code = generateNumericCode();
   const codeHash = await sha256Hex(code);
-  await createEmailVerification(env.DB, {
+  await upsertEmailVerification(env.DB, {
     id: crypto.randomUUID(),
     inviteId,
     email,
@@ -98,11 +175,12 @@ export async function requestEmailVerification(env: Env, inviteId: string, email
     subject: "Your verification code",
     html: `<p>Your verification code is <strong>${code}</strong>. It expires in 10 minutes.</p>`,
   });
+  return { ok: true };
 }
 
 export type ConfirmVerificationResult =
   | { ok: true }
-  | { ok: false; reason: "not-requested" | "expired" | "too-many-attempts" | "wrong-code" };
+  | { ok: false; reason: "invite-not-available" | "not-requested" | "expired" | "too-many-attempts" | "wrong-code" };
 
 // Checks attempts/expiry before comparing the code, then increments attempts
 // only on a wrong guess — mirrors tokenManager.ts's double-check-before-
@@ -116,7 +194,12 @@ export async function confirmEmailVerification(
   email: string,
   code: string,
 ): Promise<ConfirmVerificationResult> {
-  const verification = await findLatestEmailVerification(env.DB, inviteId, email);
+  const invite = await findTrustedInvite(env.DB, inviteId);
+  if (!invite || !isInviteReceivingVerification(invite)) {
+    return { ok: false, reason: "invite-not-available" };
+  }
+
+  const verification = await findEmailVerification(env.DB, inviteId, email);
   if (!verification) return { ok: false, reason: "not-requested" };
   if (verification.attempts >= MAX_VERIFICATION_ATTEMPTS) return { ok: false, reason: "too-many-attempts" };
   if (Date.parse(verification.expires_at) <= Date.now()) return { ok: false, reason: "expired" };
@@ -127,7 +210,19 @@ export async function confirmEmailVerification(
     return { ok: false, reason: "wrong-code" };
   }
 
-  await markInviteVerified(env.DB, inviteId, email);
+  // Already 'verified' (idempotent re-confirm, e.g. a page refresh) needs no
+  // further write. Otherwise the invite was 'pending' (the only other state
+  // isInviteReceivingVerification allows) — attempt the transition and
+  // actually check whether it took: markInviteVerified can lose a race (the
+  // invite was consumed/revoked between the read above and this write) and
+  // now reports that via its return value instead of the caller blindly
+  // trusting it, which previously let this function report `ok: true` even
+  // when the invite's real status hadn't changed (state drift, caught in
+  // this project's post-commit security review — see task_plan.md Phase 7.1).
+  if (invite.status === "pending") {
+    const transitioned = await markInviteVerified(env.DB, inviteId, email);
+    if (!transitioned) return { ok: false, reason: "invite-not-available" };
+  }
   return { ok: true };
 }
 
