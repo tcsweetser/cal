@@ -420,3 +420,151 @@ export async function listRecentSyncLogs(db: D1Database, userId: string, limit =
     .all<SyncLogRow>();
   return results;
 }
+
+// --- Trusted invites (Phase 7: appointment dialog + meeting planner, see task_plan.md) ---
+
+export type TrustedInviteKind = "appointment" | "meeting_poll";
+export type TrustedInviteStatus = "pending" | "verified" | "used" | "expired" | "revoked";
+
+export interface TrustedInviteRow {
+  id: string;
+  user_id: string;
+  account_id: string;
+  kind: TrustedInviteKind;
+  invitee_email: string;
+  status: TrustedInviteStatus;
+  meeting_poll_id: string | null;
+  booked_start: string | null;
+  booked_end: string | null;
+  google_event_id: string | null;
+  verified_email: string | null;
+  verified_at: string | null;
+  used_at: string | null;
+  expires_at: string;
+  created_at: string;
+}
+
+export interface CreateTrustedInviteInput {
+  id: string;
+  userId: string;
+  accountId: string;
+  kind: TrustedInviteKind;
+  inviteeEmail: string;
+  meetingPollId: string | null;
+  expiresAt: string;
+}
+
+export async function createTrustedInvite(db: D1Database, input: CreateTrustedInviteInput): Promise<void> {
+  await db
+    .prepare(
+      `INSERT INTO trusted_invites (id, user_id, account_id, kind, invitee_email, meeting_poll_id, expires_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    )
+    .bind(
+      input.id,
+      input.userId,
+      input.accountId,
+      input.kind,
+      input.inviteeEmail,
+      input.meetingPollId,
+      input.expiresAt,
+    )
+    .run();
+}
+
+export function findTrustedInvite(db: D1Database, id: string): Promise<TrustedInviteRow | null> {
+  return db.prepare("SELECT * FROM trusted_invites WHERE id = ?").bind(id).first<TrustedInviteRow>();
+}
+
+export async function listInvitesForUser(db: D1Database, userId: string): Promise<TrustedInviteRow[]> {
+  const { results } = await db
+    .prepare("SELECT * FROM trusted_invites WHERE user_id = ? ORDER BY created_at DESC")
+    .bind(userId)
+    .all<TrustedInviteRow>();
+  return results;
+}
+
+// Only transitions a 'pending' invite — a re-verify attempt against an
+// already-verified/used/revoked invite is silently a no-op here, since the
+// caller (trustedAccess.ts) checks status before ever getting this far.
+export async function markInviteVerified(db: D1Database, id: string, verifiedEmail: string): Promise<void> {
+  await db
+    .prepare(
+      `UPDATE trusted_invites
+       SET status = 'verified', verified_email = ?, verified_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+       WHERE id = ? AND status = 'pending'`,
+    )
+    .bind(verifiedEmail, id)
+    .run();
+}
+
+// Atomic compare-and-swap, same pattern as tryStartSyncLog above: only
+// succeeds if the invite is currently 'verified', closing the race where the
+// same link is submitted twice at once (e.g. a double form submit, or two
+// browser tabs). Returns false for anything else (already used, expired,
+// revoked, or never verified) — the caller treats all of those as "can't book".
+export async function tryConsumeInvite(db: D1Database, id: string): Promise<boolean> {
+  const result = await db
+    .prepare(
+      `UPDATE trusted_invites SET status = 'used', used_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+       WHERE id = ? AND status = 'verified'`,
+    )
+    .bind(id)
+    .run();
+  return result.meta.changes === 1;
+}
+
+export async function recordAppointmentBooking(
+  db: D1Database,
+  id: string,
+  bookedStart: string,
+  bookedEnd: string,
+  googleEventId: string,
+): Promise<void> {
+  await db
+    .prepare("UPDATE trusted_invites SET booked_start = ?, booked_end = ?, google_event_id = ? WHERE id = ?")
+    .bind(bookedStart, bookedEnd, googleEventId, id)
+    .run();
+}
+
+export interface EmailVerificationRow {
+  id: string;
+  invite_id: string;
+  email: string;
+  code_hash: string;
+  attempts: number;
+  expires_at: string;
+  created_at: string;
+}
+
+export interface CreateEmailVerificationInput {
+  id: string;
+  inviteId: string;
+  email: string;
+  codeHash: string;
+  expiresAt: string;
+}
+
+export async function createEmailVerification(db: D1Database, input: CreateEmailVerificationInput): Promise<void> {
+  await db
+    .prepare("INSERT INTO email_verifications (id, invite_id, email, code_hash, expires_at) VALUES (?, ?, ?, ?, ?)")
+    .bind(input.id, input.inviteId, input.email, input.codeHash, input.expiresAt)
+    .run();
+}
+
+// Most recent request for this (invite, email) pair — a re-request (e.g. the
+// first code expired before use) should be checked against, not an older one.
+export function findLatestEmailVerification(
+  db: D1Database,
+  inviteId: string,
+  email: string,
+): Promise<EmailVerificationRow | null> {
+  return db
+    .prepare("SELECT * FROM email_verifications WHERE invite_id = ? AND email = ? ORDER BY created_at DESC LIMIT 1")
+    .bind(inviteId, email)
+    .first<EmailVerificationRow>();
+}
+
+export async function incrementVerificationAttempts(db: D1Database, id: string): Promise<void> {
+  await db.prepare("UPDATE email_verifications SET attempts = attempts + 1 WHERE id = ?").bind(id).run();
+}

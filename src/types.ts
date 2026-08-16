@@ -8,6 +8,9 @@ export interface Env extends Cloudflare.Env {
   SESSION_SECRET: string;
   TOKEN_ENCRYPTION_KEY: string;
   PRIMARY_ACCOUNT_EMAIL: string;
+  // Resend (see src/lib/emailService.ts, task_plan.md Phase 7).
+  RESEND_API_TOKEN: string;
+  CAL_FROM_ADDRESS: string;
 }
 
 export interface SessionData {

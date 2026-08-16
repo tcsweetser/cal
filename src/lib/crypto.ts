@@ -111,3 +111,17 @@ export async function generateCodeChallenge(verifier: string): Promise<string> {
 export function generateState(): string {
   return bytesToBase64Url(crypto.getRandomValues(new Uint8Array(16)));
 }
+
+// --- One-way hashing (SHA-256, hex) ---
+
+// Used for at-rest email-verification-code hashing (trustedAccess.ts). Unlike
+// the OAuth-flow cookie (HMAC, tamper-checked against a secret) or token
+// encryption (AES-GCM, reversible) above, a leaked hash here doesn't need to
+// be MAC'd or decryptable — it only needs to make a leaked D1 row useless
+// without also knowing the original code.
+export async function sha256Hex(input: string): Promise<string> {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(input));
+  return Array.from(new Uint8Array(digest))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+}

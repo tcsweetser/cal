@@ -223,4 +223,117 @@ The series' own recurrence rule ends **2026-07-23** — a real property of the e
 
 **Process note:** all diagnostic `console.log` additions used for this investigation (`fetchRecurringInstances`'s raw-response capture, `runDailyRecurringAudit`'s per-series instance dump, the one-off `getEvent` master-record probe) were removed after root-causing — confirmed via `git diff --stat src/` showing empty against the last commit before deploying the final, clean version.
 
+## Phase 7: Trusted-party booking + multi-party meeting planner (planned, not started)
+
+Source: `TODO.md`'s two open items. Plan only — no code written yet, pending user go-ahead to start Phase 7.1.
+
+### Requirements, as clarified with the user this session
+- **No account needed for invitees** — arbitrary email addresses, not existing linked `accounts` rows. Exactly one side of every invite/poll *is* an existing linked account (primary or a specific secondary) — the owner picks which one when creating the invite; that account's calendar is what gets checked/booked.
+- **Email-verified links, not just secret links.** The owner pastes one or more invitee emails into a dashboard dialog, picks the target account, and the system **sends the invite emails itself** (not manual copy/paste — real scope increase over my initial recommendation, confirmed explicitly by the user). A link can be forwarded, but whoever opens it must verify control of *their own* inbox (a short emailed code) before the invite does anything — so forwarding doesn't bypass identity, it just moves who has to prove it.
+- **Appointment dialog bookings are a generic placeholder on the calendar** — no invitee-supplied title/description ever gets written to Google Calendar, matching the existing cross-account replica convention (`"Busy"`-style, e.g. `"Booked via invite"`). Internal-only metadata (which invite, which email) stays in D1, never in the Google event body.
+- **One-time code semantics differ by feature**, per the TODO wording: appointment-dialog codes are single-use (become invalid the moment a booking is confirmed); meeting-planner codes stay valid for repeat visits (an invitee can revise their availability) until **the chosen meeting's end time has passed**, at which point they stop working — a time-based expiry tied to the actual event, not a use-count.
+
+### New external dependency (flag before starting)
+Actually emailing invites needs a transactional email provider — nothing in the current stack sends email. **Resolved: Resend**, called via a plain `fetch` (same pattern as `googleFetch` in `googleCalendar.ts` — no new npm dependency, no SDK). New secrets, both already provisioned as real Cloudflare Worker secrets outside this session: `RESEND_API_TOKEN` and `CAL_FROM_ADDRESS` (the verified sending domain/address) — real values never entered this conversation.
+
+### Data model (two new migrations, following the existing one-migration-per-feature convention)
+
+`migrations/0005_trusted_invites.sql` — shared invite + email-verification infrastructure, plus what Feature A (appointment dialog) needs on its own:
+```sql
+CREATE TABLE trusted_invites (
+    id TEXT PRIMARY KEY NOT NULL,              -- opaque, unguessable (crypto.randomUUID) — the /book/:id or /meet/:id path segment
+    user_id TEXT NOT NULL,                      -- the owner
+    account_id TEXT NOT NULL,                   -- which linked account's calendar this targets
+    kind TEXT NOT NULL CHECK(kind IN ('appointment', 'meeting_poll')),
+    invitee_email TEXT NOT NULL COLLATE NOCASE,  -- who the owner sent it to (may differ from who verifies, if forwarded)
+    status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','verified','used','expired','revoked')),
+    meeting_poll_id TEXT,                        -- NULL for kind='appointment'; FK for kind='meeting_poll'
+    booked_start TEXT, booked_end TEXT, google_event_id TEXT,  -- kind='appointment' only, set on confirm
+    verified_email TEXT COLLATE NOCASE,          -- the email that actually completed verification (may != invitee_email)
+    verified_at TEXT, used_at TEXT, expires_at TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE,
+    FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE
+);
+
+CREATE TABLE email_verifications (
+    id TEXT PRIMARY KEY NOT NULL,
+    invite_id TEXT NOT NULL,
+    email TEXT NOT NULL COLLATE NOCASE,
+    code_hash TEXT NOT NULL,          -- SHA-256 of the 6-digit code, never store it raw (security.md posture)
+    attempts INTEGER NOT NULL DEFAULT 0,   -- capped (5) to bound brute-force of a 6-digit space
+    expires_at TEXT NOT NULL,          -- short TTL (10 min)
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    FOREIGN KEY(invite_id) REFERENCES trusted_invites(id) ON DELETE CASCADE
+);
+CREATE INDEX idx_email_verifications_invite ON email_verifications(invite_id);
+```
+`migrations/0006_meeting_polls.sql` — adds Feature B's poll/slot/vote tables once Feature A has shipped and this shared base is proven:
+```sql
+CREATE TABLE meeting_polls (
+    id TEXT PRIMARY KEY NOT NULL, user_id TEXT NOT NULL, account_id TEXT NOT NULL,
+    title TEXT,  -- owner-facing label only, never written to the Google event
+    status TEXT NOT NULL DEFAULT 'open' CHECK(status IN ('open','finalized','cancelled')),
+    chosen_slot_id TEXT, google_event_id TEXT,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE,
+    FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE
+);
+CREATE TABLE meeting_poll_slots (
+    id TEXT PRIMARY KEY NOT NULL, meeting_poll_id TEXT NOT NULL,
+    start_time TEXT NOT NULL, end_time TEXT NOT NULL,
+    FOREIGN KEY(meeting_poll_id) REFERENCES meeting_polls(id) ON DELETE CASCADE
+);
+CREATE TABLE meeting_poll_votes (
+    id TEXT PRIMARY KEY NOT NULL, meeting_poll_id TEXT NOT NULL, slot_id TEXT NOT NULL, invite_id TEXT NOT NULL,
+    available INTEGER NOT NULL CHECK(available IN (0,1)),
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    UNIQUE(slot_id, invite_id),  -- one vote per participant per slot; re-voting updates via ON CONFLICT
+    FOREIGN KEY(meeting_poll_id) REFERENCES meeting_polls(id) ON DELETE CASCADE,
+    FOREIGN KEY(slot_id) REFERENCES meeting_poll_slots(id) ON DELETE CASCADE,
+    FOREIGN KEY(invite_id) REFERENCES trusted_invites(id) ON DELETE CASCADE
+);
+-- ALTER TABLE trusted_invites ADD FOREIGN KEY isn't real SQLite syntax; meeting_poll_id's
+-- FK to meeting_polls is enforced at the application layer, same as the two cross-row
+-- invariants already documented in 0001 (SQLite CHECK can't reference another table).
+```
+
+### Phases
+
+- [ ] **Phase 7.1: Shared trusted-access infrastructure**
+  - Files: `migrations/0005_trusted_invites.sql`; `src/lib/emailService.ts` (`sendEmail(env, {to, subject, html})`, Resend HTTP API via `fetch`, mirrors `googleFetch`'s retry-on-429/5xx shape); `src/services/trustedAccess.ts` (`createInvite`, `requestEmailVerification` — generates + hashes + emails the 6-digit code, `confirmEmailVerification` — checks hash + attempts + expiry, `consumeInvite` — atomic status transition, same `INSERT...WHERE NOT EXISTS`-style compare-and-swap pattern as `tryStartSyncLog` to close the race where a link is opened twice at once); `src/db/schema.ts` extended with the corresponding query helpers.
+  - Security requirements carried over from `security.md` / this codebase's existing posture: verification codes hashed at rest (never stored raw), rate-limited attempts, short TTLs, `trusted_invites.id` unguessable (same `crypto.randomUUID()` pattern as session IDs) since it's the bearer credential in a public URL.
+  - Verification: unit tests for issue/verify/expire/attempts-exceeded, mirroring `test/syncEngine.test.ts`'s structure against real local D1.
+
+- [ ] **Phase 7.2: Feature A — appointment dialog**
+  - Files: `src/routes/invites.ts` (dashboard, `requireAuth`-gated: `POST /dashboard/invites` — paste emails + pick account + kind='appointment', one `trusted_invites` row per email; `GET /dashboard/invites` — status list); `src/routes/booking.tsx` (public, unauthenticated: `GET /book/:id` — verify-email form or booking form depending on invite status; `POST /book/:id/verify`; `POST /book/:id/confirm` — creates the placeholder event via `insertEvent` against the target account's token from `tokenManager.getValidAccessToken`, then atomically marks the invite `used`); `src/views/{invites,booking}.tsx`.
+  - Verification: integration test driving the full flow against real local D1 + mocked Google Calendar API (same `test/helpers/googleMock.ts` pattern already in use) — issue invite → verify wrong email fails → verify right email succeeds → confirm creates exactly one placeholder event and marks the invite `used` → a second confirm attempt on the same invite is rejected. Manual `wrangler dev` smoke test before considering this phase done, per this project's established pattern of not trusting static checks alone.
+
+- [ ] **Phase 7.3: Feature B — multi-party meeting planner**
+  - Files: `migrations/0006_meeting_polls.sql`; `src/routes/meetingPolls.ts` + `.tsx` view (dashboard: create poll with candidate slots + pasted participant emails, view live vote tally, finalize); `src/routes/pollVoting.tsx` (public: verify-email, then per-slot availability form, resubmittable until the poll is finalized); `trustedAccess.ts` extended with poll-aware `consumeInvite` variant (time-based expiry against `chosen_slot_id`'s `end_time`, not single-use).
+  - Booking-on-finalize reuses the same `insertEvent`-as-placeholder path Phase 7.2 built, targeting the poll's `account_id`.
+  - Verification: integration test for the full poll lifecycle (create → 2 participants verify + vote → finalize picks the fully-available slot → placeholder event created → an invite opened after the meeting's `end_time` is rejected as expired).
+
+- [ ] **Phase 7.4: Docs + verification pass**
+  - README: new "Trusted-party booking" section documenting `/book/:id` and `/meet/:id`, plus the new Resend setup step (mirrors the existing Google Cloud Console step's structure). `.env.example` gets `RESEND_API_TOKEN`/`CAL_FROM_ADDRESS` placeholders.
+  - Full-codebase re-check of the new public (unauthenticated) surface specifically — this project's established pattern (see the Phase 6 code-review/security-audit entries above) has consistently found real issues on first review of new attack surface; the public `/book`, `/meet` routes are exactly that kind of surface and should get the same treatment before considering this done.
+
+### Open items to confirm before Phase 7.1 starts
+- ~~Email provider~~ **Resolved**: Resend confirmed, `RESEND_API_TOKEN` and `CAL_FROM_ADDRESS` (sending domain, user-chosen var name) already provisioned as real Cloudflare Worker secrets (done outside this session, not via `wrangler secret put` in front of Claude — real values never entered this conversation).
+- Appointment duration/slot length for Feature A — TODO doesn't specify whether the invitee picks a fixed-duration slot (e.g. 30 min) or an arbitrary start/end; defaulting to a fixed duration set by the owner at invite-creation time unless told otherwise.
+- Whether the appointment dialog should show the target account's existing busy blocks (to steer the invitee away from an obvious double-booking) or accept any time blind — proposing blind-accept for the MVP (Feature B is where real availability-coordination logic belongs) and revisiting only if double-bookings turn out to be common in practice.
+
+### PII handling for this phase specifically (reinforces the standing rule, see memory `feedback-no-real-ids-in-config`)
+This feature's whole purpose is handling real third-party email addresses — the highest-PII-density feature this project has built. Applying the existing "never commit real identifying values" rule concretely here:
+- Test fixtures (unit/integration tests for Phase 7.1-7.3) use synthetic addresses only, matching the existing `*-account@example-*.test` convention already used in `test/helpers/fixtures.ts` — never a real address, even the owner's own.
+- The account's Cloudflare Email Routing destination addresses (7 verified, confirmed present via the Cloudflare API this session — real values deliberately not written here or anywhere else in this repo) are a candidate real-recipient pool for a genuine end-to-end manual smoke test of the Resend integration later in Phase 7.2, the same way real Google accounts were used for the original sync engine's production smoke test. Not used yet — no real email has been sent. Confirm with the user before the first real send, same as any other action with an external, visible side effect.
+- `.env.example`/README additions for `RESEND_API_TOKEN`/`CAL_FROM_ADDRESS` stay placeholder-only, matching every other secret in that file.
+
+- [x] **Phase 7.1: Shared trusted-access infrastructure — done, pending user go-ahead to commit**
+  - Files created: `migrations/0005_trusted_invites.sql` (`trusted_invites`, `email_verifications`); `src/lib/emailService.ts` (`sendEmail`, Resend HTTP client mirroring `googleFetch`'s retry-on-429/5xx shape); `src/lib/crypto.ts` extended with `sha256Hex` (at-rest verification-code hashing); `src/services/trustedAccess.ts` (`createInvite`, `sendInviteEmail`, `requestEmailVerification`, `confirmEmailVerification`, `consumeInvite`, `getUsableInvite`); `src/db/schema.ts` extended with the corresponding `trusted_invites`/`email_verifications` query helpers; `src/types.ts` extended with `RESEND_API_TOKEN`/`CAL_FROM_ADDRESS`. `.env.example` and `.dev.vars` (gitignored) both updated — `.dev.vars` got placeholder test values only, real values live solely in the already-provisioned Cloudflare Worker secrets.
+  - Var names deliberately match what's already live in production rather than inventing parallel names the user would have had to reconcile: `RESEND_API_TOKEN` (not a self-chosen `EMAIL_API_KEY`) and `CAL_FROM_ADDRESS` (not `EMAIL_FROM_ADDRESS`) — both corrected mid-implementation after the user named the real provisioned secrets.
+  - Verified: `tsc --noEmit` clean. `test/trustedAccess.test.ts` (6 new tests, mocked Resend via `test/helpers/emailMock.ts` — same install-a-fetch-stub pattern as `googleMock.ts`, no real network calls) covers: invite issuance emails only the invitee; full verify-then-consume flow (wrong code rejected, right code verifies, consume succeeds exactly once and a second consume is rejected); a forwarded link verified by a *different* email than the original invitee still succeeds, proving identity is per-verifier not per-original-recipient; 5 wrong attempts locks out even a subsequently-correct guess; consuming a never-verified invite fails; a not-found invite id is reported distinctly from other failure modes.
+  - **No real email has been sent anywhere in this phase** — every test runs against a mocked Resend endpoint. The real `RESEND_API_TOKEN`/`CAL_FROM_ADDRESS` secrets exist in the deployed Worker but nothing in this phase's code path has been exercised against them yet.
+  - Not committed to git yet — pending user go-ahead, consistent with every other phase in this file.
+
 **Resolved.** At 2026-08-13T03:50:50Z, the normal incremental sync processed 28 events and replicated `5mu28p61f4rdpe8ft99l31eg9i`'s Sept 18 occurrence to all 4 other calendars, and backfilled `example-hustle3.test`/`example-hustle2.test` (added after this series' Aug 12 original sync) for the Aug 14–Sep 11 occurrences too. Whatever caused the `UNTIL=2026-07-23` truncation was corrected upstream (event is a third-party invite the user can't edit, so this was the organizer's or Google's own doing) and picked up automatically by the existing incremental sync — no code change, redeploy, or manual force was needed once the underlying calendar data was right. Confirms the daily-audit + incremental-sync design self-heals correctly once source data is valid.
