@@ -14,7 +14,8 @@
     "db:migrate:local": "wrangler d1 migrations apply DB --local",
     "db:migrate:remote": "wrangler d1 migrations apply DB --remote",
     "test": "vitest run",
-    "provision": "node scripts/provision-cloudflare.js"
+    "provision": "node scripts/provision-cloudflare.js",
+    "ci:write-wrangler-config": "node scripts/write-ci-wrangler-config.js"
   },
   "dependencies": {
     "hono": "^4.6.0"
