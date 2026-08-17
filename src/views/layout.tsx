@@ -50,6 +50,8 @@ export const Layout: FC<PropsWithChildren<{ title: string }>> = ({ title, childr
         <a href="/dashboard">Accounts</a>
         <a href="/dashboard/mappings">Roles &amp; Tags</a>
         <a href="/dashboard/logs">Sync Logs</a>
+        <a href="/dashboard/invites">Invites</a>
+        <a href="/dashboard/settings">Settings</a>
         {/* POST, not a GET link — link prefetchers/crawlers/preview-fetchers
             following a GET /auth/logout would silently log the user out. */}
         <form method="post" action="/auth/logout">

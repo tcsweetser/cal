@@ -14,19 +14,25 @@
 
 import { sha256Hex } from "../lib/crypto";
 import { sendEmail } from "../lib/emailService";
+import { getValidAccessToken } from "./tokenManager";
+import { insertEvent, insertEventWithMeetLink, getCalendarTimeZone, fetchFreeBusy, type FreeBusyInterval } from "./googleCalendar";
 import type { Env } from "../types";
 import {
   createTrustedInvite,
   findTrustedInvite,
   findAccountForUser,
+  getOrCreateSchedulingSettings,
   markInviteVerified,
   tryConsumeInvite,
+  recordAppointmentBooking,
   upsertEmailVerification,
   findEmailVerification,
   countVerificationTargets,
   incrementVerificationAttempts,
   type TrustedInviteKind,
   type TrustedInviteRow,
+  type AppointmentModality,
+  type SchedulingSettingsRow,
 } from "../db/schema";
 
 const INVITE_TTL_MS: Record<TrustedInviteKind, number> = {
@@ -65,12 +71,26 @@ function isInviteReceivingVerification(invite: TrustedInviteRow, now = Date.now(
   return (invite.status === "pending" || invite.status === "verified") && Date.parse(invite.expires_at) > now;
 }
 
+// Owner-configurable range (scheduling_settings, migration 0006), not a
+// hardcoded list — e.g. min=30/max=90/step=15 -> [30, 45, 60, 75, 90].
+export function allowedAppointmentDurations(settings: SchedulingSettingsRow): number[] {
+  const durations: number[] = [];
+  for (let d = settings.min_duration_minutes; d <= settings.max_duration_minutes; d += settings.duration_step_minutes) {
+    durations.push(d);
+  }
+  return durations;
+}
+
 export interface CreateInviteInput {
   userId: string;
   accountId: string;
   kind: TrustedInviteKind;
   inviteeEmail: string;
   meetingPollId?: string;
+  // Both required for kind='appointment' (validated below); unused for
+  // 'meeting_poll', whose timing/format come from meeting_poll_slots (Phase 7.3).
+  durationMinutes?: number;
+  modality?: AppointmentModality;
 }
 
 // Security model (task_plan.md Phase 7): invite creation is the one place in
@@ -95,6 +115,34 @@ export async function createInvite(env: Env, input: CreateInviteInput): Promise<
   if (account.status !== "active") {
     throw new Error(`createInvite: account ${input.accountId} is not active (status: ${account.status})`);
   }
+
+  let durationMinutes: number | null = null;
+  let modality: AppointmentModality | null = null;
+  if (input.kind === "appointment") {
+    const settings = await getOrCreateSchedulingSettings(env.DB, input.userId);
+    const allowed = allowedAppointmentDurations(settings);
+    if (input.durationMinutes == null || !allowed.includes(input.durationMinutes)) {
+      throw new Error(`createInvite: durationMinutes must be one of ${allowed.join(", ")} for kind='appointment'`);
+    }
+    if (input.modality == null) {
+      throw new Error("createInvite: modality ('in_person' or 'remote') is required for kind='appointment'");
+    }
+    // Fail at creation time, not when the invitee tries to book — a remote
+    // invite whose Meet account isn't configured (or was never active) would
+    // otherwise only surface as a dead end deep in the booking flow.
+    if (input.modality === "remote") {
+      if (!settings.meet_account_id) {
+        throw new Error("createInvite: remote appointments require a Meet account to be configured in Settings first");
+      }
+      const meetAccount = await findAccountForUser(env.DB, input.userId, settings.meet_account_id);
+      if (!meetAccount || meetAccount.status !== "active") {
+        throw new Error("createInvite: the configured Meet account is no longer active — update it in Settings");
+      }
+    }
+    durationMinutes = input.durationMinutes;
+    modality = input.modality;
+  }
+
   const id = crypto.randomUUID();
   await createTrustedInvite(env.DB, {
     id,
@@ -103,6 +151,8 @@ export async function createInvite(env: Env, input: CreateInviteInput): Promise<
     kind: input.kind,
     inviteeEmail: input.inviteeEmail,
     meetingPollId: input.meetingPollId ?? null,
+    durationMinutes,
+    modality,
     expiresAt: new Date(Date.now() + INVITE_TTL_MS[input.kind]).toISOString(),
   });
   return id;
@@ -246,4 +296,261 @@ export async function getUsableInvite(
 // failure-handling styles for "can't read this invite" vs "can't consume it".
 export async function consumeInvite(env: Env, id: string): Promise<boolean> {
   return tryConsumeInvite(env.DB, id);
+}
+
+// Slots are offered/accepted every AVAILABILITY_WINDOW_DAYS out, stepped by
+// the owner's duration_step_minutes — implementation details, not owner-
+// facing parameters (only duration range/step and buffer were asked to be
+// configurable), so these stay plain constants.
+const AVAILABILITY_WINDOW_DAYS = 7;
+const MAX_OFFERED_SLOTS = 60;
+
+// Minutes-since-midnight for a UTC instant, as seen in a specific IANA zone
+// — the building block for the workday-window check below. `% 24` guards
+// against a documented Intl quirk where midnight can format as "24" instead
+// of "0" under hour12:false.
+function minutesSinceMidnightInZone(ms: number, timeZone: string): number {
+  const parts = new Intl.DateTimeFormat("en-US", { timeZone, hour: "2-digit", minute: "2-digit", hour12: false }).formatToParts(
+    new Date(ms),
+  );
+  const hour = Number(parts.find((p) => p.type === "hour")?.value ?? "0") % 24;
+  const minute = Number(parts.find((p) => p.type === "minute")?.value ?? "0");
+  return hour * 60 + minute;
+}
+
+// The owner's "never book before/after X" mask (scheduling_settings), a
+// single daily window applied every day, interpreted in the *target
+// account's* calendar timezone — owner's calendar timezone is authoritative
+// (user decision), not the invitee's browser zone. Rejects a candidate whose
+// wall-clock end falls before its wall-clock start in that zone too (the
+// meeting would cross midnight) rather than risk a false-accept from the
+// day wrapping around.
+function isWithinWorkday(startMs: number, endMs: number, timeZone: string, settings: SchedulingSettingsRow): boolean {
+  const startMinutes = minutesSinceMidnightInZone(startMs, timeZone);
+  const endMinutes = minutesSinceMidnightInZone(endMs, timeZone);
+  return (
+    endMinutes > startMinutes &&
+    startMinutes >= settings.workday_start_minutes &&
+    endMinutes <= settings.workday_end_minutes
+  );
+}
+
+// Buffer applies symmetrically — the candidate needs `buffer_minutes` of
+// clear space on *both* sides of any existing event, not just no direct
+// overlap.
+function hasBufferedConflict(startMs: number, endMs: number, bufferMs: number, busy: FreeBusyInterval[]): boolean {
+  const bufferedStart = startMs - bufferMs;
+  const bufferedEnd = endMs + bufferMs;
+  return busy.some((interval) => {
+    const busyStart = Date.parse(interval.start);
+    const busyEnd = Date.parse(interval.end);
+    return busyStart < bufferedEnd && busyEnd > bufferedStart;
+  });
+}
+
+// Only meaningful for invite.modality === 'remote'. Returns null if remote
+// meetings can't actually be completed right now — no Meet account
+// configured, or it's been disconnected/revoked since the invite was
+// created (createInvite already checks this at creation time; this is the
+// same check re-run, since settings can change afterward) — checked both
+// when offering slots and again at confirm time, so a broken Meet
+// configuration surfaces as "not available" rather than a Calendar API
+// error deep in the booking flow.
+async function resolveMeetAccessToken(
+  env: Env,
+  invite: TrustedInviteRow,
+  settings: SchedulingSettingsRow,
+  primaryAccessToken: string,
+): Promise<string | null> {
+  if (!settings.meet_account_id) return null;
+  const meetAccount = await findAccountForUser(env.DB, invite.user_id, settings.meet_account_id);
+  if (!meetAccount || meetAccount.status !== "active") return null;
+  return meetAccount.id === invite.account_id ? primaryAccessToken : getValidAccessToken(env, meetAccount.id);
+}
+
+// Creates a small helper event on the designated Meet account's own calendar
+// purely to mint a conferenceData room (see googleCalendar.ts's
+// insertEventWithMeetLink for the request shape, verified against Google's
+// current docs) and extract its join URL. Deliberately left in place, not
+// deleted after — Meet rooms created via Calendar API conferenceData are
+// tied to their event's lifecycle, and this codebase doesn't currently rely
+// on any documented deletion-safe behavior for that. The upside is
+// consistent with the rest of this account's calendar anyway: it shows the
+// same busy block a normal booking would.
+async function mintMeetLink(accessToken: string, startMs: number, endMs: number): Promise<string | null> {
+  const event = await insertEventWithMeetLink(accessToken, {
+    summary: "Busy (booked via invite)",
+    start: { dateTime: new Date(startMs).toISOString() },
+    end: { dateTime: new Date(endMs).toISOString() },
+    transparency: "opaque",
+    conferenceData: { createRequest: { requestId: crypto.randomUUID() } },
+  });
+  return event.conferenceData?.entryPoints?.find((e) => e.entryPointType === "video")?.uri ?? null;
+}
+
+export type AvailableSlotsResult =
+  | { ok: true; slots: string[]; durationMinutes: number } // slots are ISO UTC instants (start times)
+  | { ok: false; reason: "invite-not-available" | "meet-unavailable" };
+
+// Real availability, not blind-accept: computed as true UTC instants via
+// Google's freeBusy endpoint (itself always UTC — no wall-clock guessing
+// needed anywhere in this function), filtered by the owner's workday window
+// and buffer. The invitee's browser converts these same instants for
+// display client-side (routes/booking.tsx / views/booking.tsx) — nothing
+// about *which* slots are valid depends on the invitee's timezone at all.
+export async function computeAvailableSlots(env: Env, inviteId: string): Promise<AvailableSlotsResult> {
+  const invite = await findTrustedInvite(env.DB, inviteId);
+  if (!invite || invite.kind !== "appointment" || invite.duration_minutes == null || invite.modality == null) {
+    return { ok: false, reason: "invite-not-available" };
+  }
+  if (invite.status !== "verified" || isInviteExpired(invite)) {
+    return { ok: false, reason: "invite-not-available" };
+  }
+
+  const settings = await getOrCreateSchedulingSettings(env.DB, invite.user_id);
+
+  // Anything from here on touches Google (token refresh, calendar metadata,
+  // freeBusy) — a public, unauthenticated invitee is the caller, so a
+  // failure here (most realistically: the owner's Google access was revoked
+  // since the invite was created, or a transient Google API error) must
+  // degrade to a normal "not available" response, not an uncaught exception
+  // reaching app.onError's bare 500 (caught for real during this phase's
+  // wrangler dev smoke test, not hypothetical).
+  let accessToken: string;
+  let timeZone: string;
+  let busy: FreeBusyInterval[];
+  const now = Date.now();
+  const windowEnd = now + AVAILABILITY_WINDOW_DAYS * 24 * 60 * 60 * 1000;
+  try {
+    accessToken = await getValidAccessToken(env, invite.account_id);
+    if (invite.modality === "remote" && !(await resolveMeetAccessToken(env, invite, settings, accessToken))) {
+      return { ok: false, reason: "meet-unavailable" };
+    }
+    [timeZone, busy] = await Promise.all([
+      getCalendarTimeZone(accessToken),
+      fetchFreeBusy(accessToken, new Date(now).toISOString(), new Date(windowEnd).toISOString()),
+    ]);
+  } catch (err) {
+    console.error(`computeAvailableSlots: Google Calendar access failed for invite ${inviteId}:`, err instanceof Error ? err.message : err);
+    return { ok: false, reason: "invite-not-available" };
+  }
+
+  const durationMs = invite.duration_minutes * 60 * 1000;
+  const bufferMs = settings.buffer_minutes * 60 * 1000;
+  const stepMs = settings.duration_step_minutes * 60 * 1000;
+
+  // Rounds the first candidate up to the next step boundary strictly after
+  // "now" (e.g. :00/:15/:30/:45 for a 15-minute step) — Math.floor+stepMs,
+  // not Math.ceil: if "now" itself already sits exactly on a boundary,
+  // ceil would offer that exact instant as a slot, which
+  // confirmAppointmentBooking's own future-check (startMs <= Date.now())
+  // would then always reject. floor+stepMs always lands one full step past
+  // "now" regardless, so every offered slot is guaranteed bookable.
+  const slots: string[] = [];
+  for (
+    let candidateStart = Math.floor(now / stepMs) * stepMs + stepMs;
+    candidateStart < windowEnd && slots.length < MAX_OFFERED_SLOTS;
+    candidateStart += stepMs
+  ) {
+    const candidateEnd = candidateStart + durationMs;
+    if (isWithinWorkday(candidateStart, candidateEnd, timeZone, settings) && !hasBufferedConflict(candidateStart, candidateEnd, bufferMs, busy)) {
+      slots.push(new Date(candidateStart).toISOString());
+    }
+  }
+  return { ok: true, slots, durationMinutes: invite.duration_minutes };
+}
+
+export type ConfirmAppointmentResult =
+  | { ok: true; googleEventId: string }
+  | { ok: false; reason: "invite-not-available" | "invalid-time" | "slot-no-longer-available" | "meet-unavailable" };
+
+// The one place this feature actually writes to a real calendar. Order
+// matters for correctness, not just style: everything read-only (settings,
+// access tokens, the fresh free/busy re-check, resolving the Meet account)
+// happens *before* tryConsumeInvite, and every real Calendar write (minting
+// a Meet room, creating the placeholder event) happens *after* it — so
+// under a concurrent double-submit (two tabs, a retried request) at most one
+// racer can ever get past the atomic consume, and only that one writes
+// anything. The accepted tradeoff: if a write after that point still fails
+// (a transient Calendar API error), the invite is left 'used' with no
+// booking recorded rather than fully rolled back — a rare, recoverable-by-
+// hand edge case, not a saga/rollback mechanism, consistent with this
+// codebase's existing risk bar elsewhere (see tokenManager.ts's accepted KV
+// refresh race).
+//
+// startIso is a UTC instant, not a wall-clock string — it's one of the exact
+// values computeAvailableSlots offered, submitted back unmodified (see
+// views/booking.tsx's slot picker), so there's no ambiguity to resolve here
+// at all. It's re-validated against fresh free/busy data below rather than
+// trusted as still valid — the offered list can go stale between page load
+// and submission (another booking landing, or the invitee just sitting on
+// the form), and that re-check *is* the real buffer/workday enforcement.
+export async function confirmAppointmentBooking(env: Env, inviteId: string, startIso: string): Promise<ConfirmAppointmentResult> {
+  const invite = await findTrustedInvite(env.DB, inviteId);
+  if (!invite || invite.kind !== "appointment" || invite.duration_minutes == null || invite.modality == null) {
+    return { ok: false, reason: "invite-not-available" };
+  }
+  if (invite.status !== "verified" || isInviteExpired(invite)) {
+    return { ok: false, reason: "invite-not-available" };
+  }
+
+  const startMs = Date.parse(startIso);
+  if (Number.isNaN(startMs) || startMs <= Date.now()) {
+    return { ok: false, reason: "invalid-time" };
+  }
+  const endMs = startMs + invite.duration_minutes * 60 * 1000;
+
+  const settings = await getOrCreateSchedulingSettings(env.DB, invite.user_id);
+
+  // Same reasoning as computeAvailableSlots: everything read-only that
+  // touches Google happens before tryConsumeInvite, wrapped so a failure
+  // (revoked owner access, a transient Google error) degrades to a normal
+  // "not available" response instead of an uncaught exception — nothing
+  // here has consumed the invite yet, so there's nothing to leave in a bad
+  // state by bailing out early.
+  let accessToken: string;
+  let meetAccessToken: string | null = null;
+  let timeZone: string;
+  try {
+    accessToken = await getValidAccessToken(env, invite.account_id);
+    let busy: FreeBusyInterval[];
+    [timeZone, busy] = await Promise.all([
+      getCalendarTimeZone(accessToken),
+      fetchFreeBusy(accessToken, new Date(startMs).toISOString(), new Date(endMs).toISOString()),
+    ]);
+    if (!isWithinWorkday(startMs, endMs, timeZone, settings) || hasBufferedConflict(startMs, endMs, settings.buffer_minutes * 60 * 1000, busy)) {
+      return { ok: false, reason: "slot-no-longer-available" };
+    }
+    if (invite.modality === "remote") {
+      meetAccessToken = await resolveMeetAccessToken(env, invite, settings, accessToken);
+      if (!meetAccessToken) return { ok: false, reason: "meet-unavailable" };
+    }
+  } catch (err) {
+    console.error(`confirmAppointmentBooking: Google Calendar access failed for invite ${inviteId}:`, err instanceof Error ? err.message : err);
+    return { ok: false, reason: "invite-not-available" };
+  }
+
+  const consumed = await tryConsumeInvite(env.DB, inviteId);
+  if (!consumed) return { ok: false, reason: "invite-not-available" }; // lost a race, or expired between the read above and now
+
+  const meetUrl = meetAccessToken ? await mintMeetLink(meetAccessToken, startMs, endMs) : null;
+
+  // Generic placeholder only — no invitee-supplied title/description is ever
+  // written to the real calendar (user decision, see task_plan.md Phase 7's
+  // clarified requirements). The Meet link is the one exception, and
+  // deliberately so: it's system-generated, not invitee content, and the
+  // owner needs it to actually join a remote meeting they've been booked
+  // into — the "generic placeholder" rule is about not leaking what the
+  // invitee typed, not about the event carrying zero operationally-necessary
+  // information.
+  const event = await insertEvent(accessToken, {
+    summary: "Busy (booked via invite)",
+    ...(meetUrl ? { description: `Join: ${meetUrl}` } : {}),
+    start: { dateTime: new Date(startMs).toISOString(), timeZone },
+    end: { dateTime: new Date(endMs).toISOString(), timeZone },
+    transparency: "opaque",
+  });
+
+  await recordAppointmentBooking(env.DB, inviteId, new Date(startMs).toISOString(), new Date(endMs).toISOString(), event.id);
+  return { ok: true, googleEventId: event.id };
 }

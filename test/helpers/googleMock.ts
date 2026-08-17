@@ -1,7 +1,10 @@
 import { vi } from "vitest";
 import type { GoogleCalendarEvent } from "../../src/services/googleCalendar";
+import type { FreeBusyInterval } from "../../src/services/googleCalendar";
 
 const EVENTS_URL = "https://www.googleapis.com/calendar/v3/calendars/primary/events";
+const CALENDAR_URL = "https://www.googleapis.com/calendar/v3/calendars/primary";
+const FREEBUSY_URL = "https://www.googleapis.com/calendar/v3/freeBusy";
 
 export interface MockInsert {
   accessToken: string;
@@ -43,6 +46,16 @@ export class GoogleCalendarMock {
   patches: MockPatch[] = [];
   deletes: MockDelete[] = [];
   private nextId = 1;
+  // What calendars.get('primary') and freeBusy.query should report for a
+  // given access token — UTC / no busy intervals unless a test configures
+  // otherwise, so tests that don't care about timezone/availability specifics
+  // (most of syncEngine.test.ts) can ignore these entirely. Not "consumed
+  // once" like listQueues — computeAvailableSlots and confirmAppointmentBooking
+  // (trustedAccess.ts) both call freeBusy in the same test, and both should
+  // see the same configured state unless a test explicitly calls setFreeBusy
+  // again between the two (e.g. to simulate a slot going stale).
+  private calendarTimeZones = new Map<string, string>();
+  private freeBusyByToken = new Map<string, FreeBusyInterval[]>();
 
   queueList(accessToken: string, response: { events: GoogleCalendarEvent[]; nextSyncToken: string } | "410") {
     const queue = this.listQueues.get(accessToken) ?? [];
@@ -66,13 +79,26 @@ export class GoogleCalendarMock {
     this.poisonedOriginEventIds.add(originEventId);
   }
 
+  setCalendarTimeZone(accessToken: string, timeZone: string) {
+    this.calendarTimeZones.set(accessToken, timeZone);
+  }
+
+  setFreeBusy(accessToken: string, intervals: FreeBusyInterval[]) {
+    this.freeBusyByToken.set(accessToken, intervals);
+  }
+
   private bearer(init?: RequestInit): string {
     const headers = init?.headers as Record<string, string> | undefined;
     const auth = headers?.Authorization ?? "";
     return auth.replace(/^Bearer /, "");
   }
 
+  // Delegates anything it doesn't recognize to whatever fetch was installed
+  // before it, rather than throwing outright — so this composes with another
+  // mock (e.g. ResendMock) installed in either order in the same test,
+  // instead of one silently clobbering the other via vi.stubGlobal.
   install() {
+    const previousFetch = globalThis.fetch;
     const fn = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = new URL(String(input));
       const method = init?.method ?? "GET";
@@ -91,6 +117,7 @@ export class GoogleCalendarMock {
       if (url.origin + url.pathname === EVENTS_URL && method === "POST") {
         const body = JSON.parse(String(init?.body)) as {
           extendedProperties?: { private?: { originEventId?: string } };
+          conferenceData?: { createRequest?: { requestId?: string } };
         };
         const originEventId = body.extendedProperties?.private?.originEventId;
         // Persistent (not consumed) so retries inside googleFetch also fail —
@@ -101,7 +128,28 @@ export class GoogleCalendarMock {
         }
         this.inserts.push({ accessToken, body });
         const id = `mock-event-${this.nextId++}`;
-        return new Response(JSON.stringify({ id, ...body }), { status: 200 });
+        // insertEventWithMeetLink (googleCalendar.ts) posts to this same
+        // path+conferenceDataVersion=1 query param — url.pathname ignores
+        // the query string, so it lands here too. Only fabricate
+        // conferenceData when the request actually asked for it, matching
+        // Google's real "pending -> success" shape closely enough for tests
+        // that just need a real-looking entryPoints URI.
+        const conferenceData = body.conferenceData?.createRequest
+          ? {
+              conferenceSolution: { key: { type: "hangoutsMeet" } },
+              entryPoints: [{ entryPointType: "video", uri: `https://meet.google.com/mock-${id}` }],
+            }
+          : undefined;
+        return new Response(JSON.stringify({ id, ...body, ...(conferenceData ? { conferenceData } : {}) }), { status: 200 });
+      }
+
+      if (url.origin + url.pathname === CALENDAR_URL && method === "GET") {
+        return new Response(JSON.stringify({ timeZone: this.calendarTimeZones.get(accessToken) ?? "UTC" }), { status: 200 });
+      }
+
+      if (url.origin + url.pathname === FREEBUSY_URL && method === "POST") {
+        const busy = this.freeBusyByToken.get(accessToken) ?? [];
+        return new Response(JSON.stringify({ calendars: { primary: { busy } } }), { status: 200 });
       }
 
       // Checked before the generic patchMatch below — its (.+)$ would
@@ -142,7 +190,10 @@ export class GoogleCalendarMock {
         return new Response(JSON.stringify({ id: eventId, status: "confirmed" }), { status: 200 });
       }
 
-      throw new Error(`Unhandled mock request: ${method} ${url.toString()}`);
+      if (url.origin + url.pathname === EVENTS_URL || instancesMatch || patchMatch) {
+        throw new Error(`Unhandled mock request: ${method} ${url.toString()}`);
+      }
+      return previousFetch(input, init);
     });
 
     vi.stubGlobal("fetch", fn);

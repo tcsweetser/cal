@@ -13,7 +13,15 @@ CREATE TABLE IF NOT EXISTS trusted_invites (
     -- kind='meeting_poll' only; the poll row itself lands in migration 0006,
     -- once Phase 7.1/7.2 (this table) has shipped and proven out.
     meeting_poll_id TEXT,
-    -- kind='appointment' only, set on confirm.
+    -- kind='appointment' only, both set by the owner at invite-creation time.
+    -- duration_minutes is validated against scheduling_settings (migration
+    -- 0006) at creation time, not a fixed set here — the range/step live in
+    -- that table so they're owner-configurable without a schema change.
+    -- modality decides whether confirmAppointmentBooking (trustedAccess.ts)
+    -- also mints a Google Meet link via scheduling_settings.meet_account_id.
+    -- booked_start/booked_end/google_event_id are set once, on confirm.
+    duration_minutes INTEGER,
+    modality TEXT CHECK(modality IN ('in_person', 'remote')),
     booked_start TEXT,
     booked_end TEXT,
     google_event_id TEXT,
@@ -33,6 +41,14 @@ CREATE TABLE IF NOT EXISTS trusted_invites (
     CHECK(
         (kind = 'appointment' AND meeting_poll_id IS NULL) OR
         (kind = 'meeting_poll' AND meeting_poll_id IS NOT NULL)
+    ),
+    CHECK(
+        (kind = 'appointment' AND duration_minutes IS NOT NULL) OR
+        (kind = 'meeting_poll' AND duration_minutes IS NULL)
+    ),
+    CHECK(
+        (kind = 'appointment' AND modality IS NOT NULL) OR
+        (kind = 'meeting_poll' AND modality IS NULL)
     )
 );
 

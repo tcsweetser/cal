@@ -438,6 +438,7 @@ export async function listRecentSyncLogs(db: D1Database, userId: string, limit =
 
 export type TrustedInviteKind = "appointment" | "meeting_poll";
 export type TrustedInviteStatus = "pending" | "verified" | "used" | "expired" | "revoked";
+export type AppointmentModality = "in_person" | "remote";
 
 export interface TrustedInviteRow {
   id: string;
@@ -447,6 +448,8 @@ export interface TrustedInviteRow {
   invitee_email: string;
   status: TrustedInviteStatus;
   meeting_poll_id: string | null;
+  duration_minutes: number | null;
+  modality: AppointmentModality | null;
   booked_start: string | null;
   booked_end: string | null;
   google_event_id: string | null;
@@ -464,14 +467,16 @@ export interface CreateTrustedInviteInput {
   kind: TrustedInviteKind;
   inviteeEmail: string;
   meetingPollId: string | null;
+  durationMinutes: number | null;
+  modality: AppointmentModality | null;
   expiresAt: string;
 }
 
 export async function createTrustedInvite(db: D1Database, input: CreateTrustedInviteInput): Promise<void> {
   await db
     .prepare(
-      `INSERT INTO trusted_invites (id, user_id, account_id, kind, invitee_email, meeting_poll_id, expires_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO trusted_invites (id, user_id, account_id, kind, invitee_email, meeting_poll_id, duration_minutes, modality, expires_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     )
     .bind(
       input.id,
@@ -480,6 +485,8 @@ export async function createTrustedInvite(db: D1Database, input: CreateTrustedIn
       input.kind,
       input.inviteeEmail,
       input.meetingPollId,
+      input.durationMinutes,
+      input.modality,
       input.expiresAt,
     )
     .run();
@@ -497,18 +504,22 @@ export async function listInvitesForUser(db: D1Database, userId: string): Promis
   return results;
 }
 
-// Only transitions a 'pending' invite. Returns whether it actually did, same
-// compare-and-swap shape as tryConsumeInvite below — the caller
-// (trustedAccess.ts) checks this rather than assuming success, after an
-// earlier version silently no-op'd against an already-used/revoked invite
+// Only transitions a 'pending', not-yet-expired invite. Returns whether it
+// actually did, same compare-and-swap shape as tryConsumeInvite below — the
+// caller (trustedAccess.ts) checks this rather than assuming success, after
+// an earlier version silently no-op'd against an already-used/revoked invite
 // while still reporting "verified" to the caller (state drift, caught in
 // this project's post-commit security review, see task_plan.md Phase 7.1).
+// The `expires_at` check was added slightly later in that same review's
+// follow-up (Phase 7.2): without it, an invite past its TTL but still
+// sitting in 'pending' status (expiry here is lazy/read-time, not a
+// background job — see isInviteExpired) could still be verified.
 export async function markInviteVerified(db: D1Database, id: string, verifiedEmail: string): Promise<boolean> {
   const result = await db
     .prepare(
       `UPDATE trusted_invites
        SET status = 'verified', verified_email = ?, verified_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
-       WHERE id = ? AND status = 'pending'`,
+       WHERE id = ? AND status = 'pending' AND expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now')`,
     )
     .bind(verifiedEmail, id)
     .run();
@@ -516,15 +527,17 @@ export async function markInviteVerified(db: D1Database, id: string, verifiedEma
 }
 
 // Atomic compare-and-swap, same pattern as tryStartSyncLog above: only
-// succeeds if the invite is currently 'verified', closing the race where the
-// same link is submitted twice at once (e.g. a double form submit, or two
-// browser tabs). Returns false for anything else (already used, expired,
-// revoked, or never verified) — the caller treats all of those as "can't book".
+// succeeds if the invite is currently 'verified' and not past its expiry
+// (same lazy-expiry gap as markInviteVerified above, closed the same way),
+// closing the race where the same link is submitted twice at once (e.g. a
+// double form submit, or two browser tabs). Returns false for anything else
+// (already used, expired, revoked, or never verified) — the caller treats
+// all of those as "can't book".
 export async function tryConsumeInvite(db: D1Database, id: string): Promise<boolean> {
   const result = await db
     .prepare(
       `UPDATE trusted_invites SET status = 'used', used_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
-       WHERE id = ? AND status = 'verified'`,
+       WHERE id = ? AND status = 'verified' AND expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now')`,
     )
     .bind(id)
     .run();
@@ -612,4 +625,86 @@ export async function countVerificationTargets(db: D1Database, inviteId: string)
 
 export async function incrementVerificationAttempts(db: D1Database, id: string): Promise<void> {
   await db.prepare("UPDATE email_verifications SET attempts = attempts + 1 WHERE id = ?").bind(id).run();
+}
+
+// --- Scheduling settings (Phase 7.2 requirements revision, see task_plan.md) ---
+
+export interface SchedulingSettingsRow {
+  user_id: string;
+  min_duration_minutes: number;
+  max_duration_minutes: number;
+  duration_step_minutes: number;
+  buffer_minutes: number;
+  workday_start_minutes: number;
+  workday_end_minutes: number;
+  meet_account_id: string | null;
+  updated_at: string;
+}
+
+// Every user has exactly one row, created lazily with defaults on first
+// access (INSERT ... ON CONFLICT DO NOTHING then SELECT) rather than
+// requiring a separate onboarding step — callers never need to handle "no
+// settings yet" as a distinct case.
+export async function getOrCreateSchedulingSettings(db: D1Database, userId: string): Promise<SchedulingSettingsRow> {
+  await db
+    .prepare("INSERT INTO scheduling_settings (user_id) VALUES (?) ON CONFLICT(user_id) DO NOTHING")
+    .bind(userId)
+    .run();
+  const row = await db
+    .prepare("SELECT * FROM scheduling_settings WHERE user_id = ?")
+    .bind(userId)
+    .first<SchedulingSettingsRow>();
+  if (!row) throw new Error(`getOrCreateSchedulingSettings: row missing immediately after upsert for user ${userId}`);
+  return row;
+}
+
+export interface UpdateSchedulingSettingsInput {
+  minDurationMinutes: number;
+  maxDurationMinutes: number;
+  durationStepMinutes: number;
+  bufferMinutes: number;
+  workdayStartMinutes: number;
+  workdayEndMinutes: number;
+  meetAccountId: string | null;
+}
+
+// UPSERT, not a plain UPDATE: a caller that hasn't already seeded defaults
+// via getOrCreateSchedulingSettings (every route in this codebase does, but
+// nothing forces that) would otherwise have this silently affect zero rows
+// with no error at all. Relies on the table's own CHECK constraints
+// (migration 0006) to reject an inconsistent combination (e.g. a step that
+// doesn't evenly divide the range) — the route layer (routes/settings.tsx)
+// still validates early for a friendlier error message, but this is the
+// real enforcement point.
+export async function updateSchedulingSettings(
+  db: D1Database,
+  userId: string,
+  input: UpdateSchedulingSettingsInput,
+): Promise<void> {
+  await db
+    .prepare(
+      `INSERT INTO scheduling_settings
+         (user_id, min_duration_minutes, max_duration_minutes, duration_step_minutes, buffer_minutes,
+          workday_start_minutes, workday_end_minutes, meet_account_id)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(user_id) DO UPDATE SET
+         min_duration_minutes = excluded.min_duration_minutes,
+         max_duration_minutes = excluded.max_duration_minutes,
+         duration_step_minutes = excluded.duration_step_minutes,
+         buffer_minutes = excluded.buffer_minutes,
+         workday_start_minutes = excluded.workday_start_minutes,
+         workday_end_minutes = excluded.workday_end_minutes,
+         meet_account_id = excluded.meet_account_id`,
+    )
+    .bind(
+      userId,
+      input.minDurationMinutes,
+      input.maxDurationMinutes,
+      input.durationStepMinutes,
+      input.bufferMinutes,
+      input.workdayStartMinutes,
+      input.workdayEndMinutes,
+      input.meetAccountId,
+    )
+    .run();
 }

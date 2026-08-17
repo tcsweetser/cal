@@ -18,10 +18,15 @@ export class ResendMock {
     this.failNext = true;
   }
 
+  // Delegates anything it doesn't recognize to whatever fetch was installed
+  // before it, rather than throwing outright — so this composes with another
+  // mock (e.g. GoogleCalendarMock) installed in either order in the same
+  // test, instead of one silently clobbering the other via vi.stubGlobal.
   install() {
+    const previousFetch = globalThis.fetch;
     const fn = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input);
-      if (url !== RESEND_URL) throw new Error(`Unhandled mock request: ${url}`);
+      if (url !== RESEND_URL) return previousFetch(input, init);
 
       if (this.failNext) {
         this.failNext = false;

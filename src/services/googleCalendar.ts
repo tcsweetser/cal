@@ -3,6 +3,8 @@
 // calendarId is always "primary", never parameterized.
 
 const EVENTS_URL = "https://www.googleapis.com/calendar/v3/calendars/primary/events";
+const CALENDAR_URL = "https://www.googleapis.com/calendar/v3/calendars/primary";
+const FREEBUSY_URL = "https://www.googleapis.com/calendar/v3/freeBusy";
 const MAX_RETRY_ATTEMPTS = 3;
 // ~10,000 events at 250/page — well past any reasonable single calendar, but
 // bounds worst-case pagination against the Worker's subrequest/CPU limits.
@@ -29,6 +31,14 @@ export interface GoogleCalendarEvent {
   // (syncEngine.ts) uses to discover which series exist at all, since we
   // never otherwise fetch the master event itself.
   recurringEventId?: string;
+  // Populated by Google once a conferenceData.createRequest (see
+  // insertEventWithMeetLink below) resolves — trustedAccess.ts reads
+  // entryPoints for the actual join URL.
+  conferenceData?: {
+    conferenceSolution?: { key?: { type?: string } };
+    entryPoints?: Array<{ entryPointType: string; uri: string }>;
+  };
+  description?: string;
 }
 
 export interface EventsDeltaResult {
@@ -183,6 +193,71 @@ export async function insertEvent(
   });
   if (!res.ok) throw new Error(`Google Calendar insert failed: ${res.status} ${await res.text()}`);
   return res.json<GoogleCalendarEvent>();
+}
+
+// Sets conferenceDataVersion=1 and expects the caller's body to include
+// conferenceData.createRequest.requestId — per Google's documented shape for
+// auto-generating a Meet link on insert (verified against current docs this
+// session, not assumed from memory). A separate function from insertEvent,
+// not a flag on it: every other caller of insertEvent (the appointment
+// placeholder itself, when not remote) has no reason to ever touch
+// conferencing, and keeping the plain path's signature/behavior unchanged
+// avoids any risk of an accidental conferenceDataVersion on a call site that
+// doesn't want it.
+export async function insertEventWithMeetLink(
+  accessToken: string,
+  body: Record<string, unknown>,
+): Promise<GoogleCalendarEvent> {
+  const res = await googleFetch(`${EVENTS_URL}?conferenceDataVersion=1`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) throw new Error(`Google Calendar insert (with Meet link) failed: ${res.status} ${await res.text()}`);
+  return res.json<GoogleCalendarEvent>();
+}
+
+interface CalendarMetadata {
+  timeZone?: string;
+}
+
+// Used to attach the correct timeZone to a booked appointment (see
+// confirmAppointmentBooking, trustedAccess.ts) so it displays correctly on
+// the target account's own calendar — the owner's calendar timezone is
+// authoritative (user decision), not the invitee's browser zone.
+export async function getCalendarTimeZone(accessToken: string): Promise<string> {
+  const res = await googleFetch(CALENDAR_URL, {
+    headers: { Authorization: `Bearer ${accessToken}` },
+  });
+  if (!res.ok) throw new Error(`Google Calendar metadata fetch failed: ${res.status} ${await res.text()}`);
+  const data = await res.json<CalendarMetadata>();
+  return data.timeZone ?? "UTC";
+}
+
+export interface FreeBusyInterval {
+  start: string;
+  end: string;
+}
+
+interface FreeBusyResponse {
+  calendars?: Record<string, { busy?: FreeBusyInterval[] }>;
+}
+
+// Used by computeAvailableSlots (trustedAccess.ts) to check real availability
+// on the target calendar — deliberately Google's purpose-built endpoint
+// rather than fetching every event via fetchEventsDelta/events.list and
+// computing busy blocks ourselves: it's a single call, always returns
+// absolute UTC instants (no timezone ambiguity to resolve on our side at
+// all), and needs no syncToken/window-filter machinery.
+export async function fetchFreeBusy(accessToken: string, timeMin: string, timeMax: string): Promise<FreeBusyInterval[]> {
+  const res = await googleFetch(FREEBUSY_URL, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ timeMin, timeMax, items: [{ id: "primary" }] }),
+  });
+  if (!res.ok) throw new Error(`Google Calendar freeBusy failed: ${res.status} ${await res.text()}`);
+  const data = await res.json<FreeBusyResponse>();
+  return data.calendars?.primary?.busy ?? [];
 }
 
 export async function patchEvent(
