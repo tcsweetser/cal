@@ -8,8 +8,10 @@ What are the best options to deploy this upon commit/push?
 Should be create a test/prod branch structure?
 - Decided: Cloudflare Workers Builds (native Git integration), secret-env-var approach — matches your other Workers-with-bindings projects' shape (`wrangler deploy` on `master`, `wrangler versions upload` on other branches for previews) but keeps real D1/KV IDs out of git, since (unlike those projects) this repo is public.
 - **Repo side is done**: `scripts/write-ci-wrangler-config.js` (new) assembles `wrangler.local.jsonc` from two secret build env vars at build time; `npm run ci:write-wrangler-config` runs it. Verified locally (`tsc`/`wrangler --dry-run` still clean after a round-trip through the script).
-- **You're connecting the repo to Cloudflare yourself** (GitHub authorization + dashboard connection) rather than having this done via API — full step-by-step with the exact build/deploy commands and the two env var names to set is in `DEPLOYMENT.md`'s new "Continuous deployment (Workers Builds)" section.
-- Reminder, same as before: once connected, every push to `master` auto-deploys to production immediately — including the Phase 7.1-7.4 trusted-invite/meeting-poll work, now committed locally (`d4235ff`) but not yet pushed.
+- **Repo is now connected** (you did this yourself in the dashboard). Two things still need fixing there before the first push will build successfully — deploy command and secret env vars — full cut-and-paste values are in `cf-workers-builds-setup.txt` (gitignored, real IDs, not tracked).
+- Reminder, same as before: once the trigger is fixed, every push to `master` auto-deploys to production immediately — including the Phase 7.1-7.4 trusted-invite/meeting-poll work, committed locally (`d4235ff`) but not yet pushed.
 
 ~~Delete the comparison document from the repo, repo history and any commits.~~ Done — `COMPARISON.md` was never committed (confirmed via `git log --all -- COMPARISON.md`, no hits), so it was just deleted from disk; no history rewrite was needed.
+
+- [ ] Dev branch + PR gate, so nothing reaches `master` (and therefore production) without review. Plan written up, nothing implemented yet: see `task_plan.md`'s "Phase 8 (planned, not started): dev branch workflow + PR gate". Scoped to git branch protection + a `dev` branch + a basic Actions CI check for now — a proper staging Cloudflare Worker/D1/KV and PR automation (preview URLs, etc.) are explicitly deferred to a later pass.
 
