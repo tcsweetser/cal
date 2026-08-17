@@ -161,7 +161,8 @@ Once the manual deploy above works, you can connect this repo to [Workers Builds
 2. Choose **GitHub**, authorize access to the `cal` repository if prompted (the Cloudflare GitHub App may already be installed on your account from other projects — if so, just add this repo to it).
 3. Configure the **production trigger** (branch: `master`):
    - Build command: *(leave empty — same as this account's other Workers)*
-   - Deploy command: `npm run ci:write-wrangler-config && npx wrangler deploy -c wrangler.local.jsonc`
+   - Deploy command: `npm run ci:write-wrangler-config && npx wrangler d1 migrations apply cal-replication-db --remote -c wrangler.local.jsonc && npx wrangler deploy -c wrangler.local.jsonc`
+   - The migrations step runs *before* the code deploy (expand-first) and applies unattended — `wrangler d1 migrations apply` auto-confirms its "continue?" prompt in a non-interactive shell. Added after the first live deploy hit `D1_ERROR: no such table` on routes depending on migrations 0005-0007, which had been merged but never applied to production — `wrangler deploy` only ships code/bindings, it never touches D1 schema on its own.
 4. Configure the **non-production branch trigger** (all other branches, for preview deployments):
    - Build command: *(leave empty)*
    - Deploy command: `npm run ci:write-wrangler-config && npx wrangler versions upload -c wrangler.local.jsonc`
