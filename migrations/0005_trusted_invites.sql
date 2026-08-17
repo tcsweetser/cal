@@ -10,8 +10,8 @@ CREATE TABLE IF NOT EXISTS trusted_invites (
     kind TEXT NOT NULL CHECK(kind IN ('appointment', 'meeting_poll')),
     invitee_email TEXT NOT NULL COLLATE NOCASE,
     status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending', 'verified', 'used', 'expired', 'revoked')),
-    -- kind='meeting_poll' only; the poll row itself lands in migration 0006,
-    -- once Phase 7.1/7.2 (this table) has shipped and proven out.
+    -- kind='meeting_poll' only; the poll row itself lands in migration 0007
+    -- (Phase 7.3), once Phase 7.1/7.2 (this table) had shipped and proven out.
     meeting_poll_id TEXT,
     -- kind='appointment' only, both set by the owner at invite-creation time.
     -- duration_minutes is validated against scheduling_settings (migration
@@ -36,7 +36,7 @@ CREATE TABLE IF NOT EXISTS trusted_invites (
     FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE,
     FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE,
     -- meeting_poll_id -> meeting_polls(id) is an application-level FK only:
-    -- meeting_polls doesn't exist until migration 0006, and SQLite can't add
+    -- meeting_polls doesn't exist until migration 0007, and SQLite can't add
     -- a FOREIGN KEY referencing a not-yet-created table.
     CHECK(
         (kind = 'appointment' AND meeting_poll_id IS NULL) OR
@@ -61,12 +61,22 @@ CREATE INDEX IF NOT EXISTS idx_trusted_invites_poll ON trusted_invites(meeting_p
 -- without losing the invite's own state, and code_hash means a leaked D1 row
 -- doesn't hand out a live code (same reasoning as never storing OAuth tokens
 -- unencrypted, see tokenManager.ts / plan.md §5.2).
+-- `sends` is a lifetime counter, separate from `attempts` (wrong-code
+-- guesses): the per-address 60s resend cooldown alone doesn't bound the
+-- *total* number of emails one (invite, email) pair can ever receive, since
+-- upsertEmailVerification refreshes created_at on every conflict, sliding
+-- the cooldown window forward indefinitely rather than ending it. Without a
+-- lifetime cap, a poll invite's 30-day TTL allows on the order of 40,000+
+-- sends to one address before the cooldown alone would stop it — found in
+-- an independent security review of Phase 7.3, closed by
+-- MAX_VERIFICATION_SENDS_PER_TARGET in trustedAccess.ts.
 CREATE TABLE IF NOT EXISTS email_verifications (
     id TEXT PRIMARY KEY NOT NULL,
     invite_id TEXT NOT NULL,
     email TEXT NOT NULL COLLATE NOCASE,
     code_hash TEXT NOT NULL,
     attempts INTEGER NOT NULL DEFAULT 0,
+    sends INTEGER NOT NULL DEFAULT 0,
     expires_at TEXT NOT NULL,
     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
     FOREIGN KEY(invite_id) REFERENCES trusted_invites(id) ON DELETE CASCADE

@@ -1,4 +1,5 @@
 import { Hono, type Context } from "hono";
+import { getCookie, setCookie } from "hono/cookie";
 import type { AppBindings } from "../types";
 import {
   getUsableInvite,
@@ -6,6 +7,10 @@ import {
   confirmEmailVerification,
   computeAvailableSlots,
   confirmAppointmentBooking,
+  INVITE_VERIFY_COOKIE,
+  signInviteVerifyCookie,
+  verifyInviteVerifyCookie,
+  inviteCookieMaxAgeSeconds,
   type RequestVerificationResult,
   type ConfirmVerificationResult,
   type AvailableSlotsResult,
@@ -37,6 +42,7 @@ const VERIFY_ERROR_MESSAGES: Record<Extract<RequestVerificationResult, { ok: fal
   "invalid-email": "That doesn't look like a valid email address.",
   cooldown: "A code was already sent recently — check your inbox, or wait a minute before requesting another.",
   "too-many-targets": "Too many email addresses have been tried for this link.",
+  "send-failed": "Couldn't send the code right now. Please try again in a moment.",
 };
 
 const CONFIRM_ERROR_MESSAGES: Record<Extract<ConfirmVerificationResult, { ok: false }>["reason"], string> = {
@@ -83,6 +89,16 @@ booking.get("/book/:id", async (c) => {
     return c.html(<BookingErrorPage message="This appointment has already been booked." />);
   }
   if (invite.status === "verified") {
+    // DB status alone isn't proof THIS caller is the one who verified — see
+    // INVITE_VERIFY_COOKIE's doc comment in trustedAccess.ts for the bug
+    // this closes (found in an independent security review of Phase 7.3).
+    // Without this, anyone who obtained the URL after someone else verified
+    // it — forwarded mail, a screenshot, a shared link — could book on their
+    // behalf with no proof of their own inbox control.
+    const cookieEmail = await verifyInviteVerifyCookie(c.env, id, getCookie(c, INVITE_VERIFY_COOKIE));
+    if (!cookieEmail || cookieEmail !== invite.verified_email) {
+      return c.html(<EmailVerifyForm inviteId={id} />);
+    }
     return renderSlotPicker(c, id);
   }
   return c.html(<EmailVerifyForm inviteId={id} />);
@@ -110,6 +126,27 @@ booking.post("/book/:id/confirm-email", async (c) => {
   if (!result.ok) {
     return c.html(<CodeEntryForm inviteId={id} email={email} error={CONFIRM_ERROR_MESSAGES[result.reason]} />);
   }
+
+  // confirmEmailVerification's 'verified'-status branch (unchanged by this
+  // fix) lets a *different* email independently pass its own code check
+  // against an invite someone else already verified — check the invite's
+  // actual recorded verified_email matches what was just confirmed before
+  // handing out a cookie, so that case fails here (a clear dead end) rather
+  // than succeeding into a cookie that every later step would then reject
+  // anyway (each invite belongs to one participant; there's no legitimate
+  // reason for a second identity to attach to one that's already bound).
+  const usable = await getUsableInvite(c.env, id);
+  if (!usable.invite || usable.invite.verified_email !== email) {
+    return c.html(<BookingErrorPage message="This link isn't available anymore." />);
+  }
+
+  setCookie(c, INVITE_VERIFY_COOKIE, await signInviteVerifyCookie(c.env, id, email), {
+    httpOnly: true,
+    secure: true,
+    sameSite: "Lax",
+    maxAge: inviteCookieMaxAgeSeconds("appointment"),
+    path: `/book/${id}`,
+  });
   return renderSlotPicker(c, id);
 });
 
@@ -128,6 +165,15 @@ booking.post("/book/:id/confirm", async (c) => {
     return c.html(<BookingErrorPage message="This link isn't available anymore." />);
   }
   const durationMinutes = before.invite.duration_minutes;
+
+  // Same cookie proof required here as the GET entry point — without it,
+  // anyone holding the URL after someone else verified it could complete
+  // the actual booking, not just view the slot picker (found in an
+  // independent security review of Phase 7.3).
+  const cookieEmail = await verifyInviteVerifyCookie(c.env, id, getCookie(c, INVITE_VERIFY_COOKIE));
+  if (!cookieEmail || cookieEmail !== before.invite.verified_email) {
+    return c.html(<BookingErrorPage message="This link isn't available anymore." />);
+  }
 
   const result = await confirmAppointmentBooking(c.env, id, start);
   if (!result.ok) {

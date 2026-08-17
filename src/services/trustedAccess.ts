@@ -6,13 +6,16 @@
 // identity here is "proven control of this inbox," not "matches the
 // original recipient."
 //
-// Phase 7.1 scope only: invite issuance, email delivery, and the
-// verify/consume lifecycle. Phase 7.3 (meeting planner) will extend this
-// with a poll-aware variant whose expiry is tied to the chosen slot's end
-// time rather than a fixed TTL/single use — not built here, per this
-// project's "don't build for a phase that hasn't started" convention.
+// Phase 7.1: invite issuance, email delivery, and the verify/consume
+// lifecycle, shared by both features below. Phase 7.2: appointment booking
+// (single-use invites, real availability). Phase 7.3: the meeting-planner
+// poll functions further down — poll invites are *not* single-use like an
+// appointment invite (voting is resubmittable across multiple visits until
+// the poll is finalized), so they never go through tryConsumeInvite at all;
+// their usability is instead governed by isPollLinkExpired, tied to the
+// chosen slot's end time once finalized.
 
-import { sha256Hex } from "../lib/crypto";
+import { sha256Hex, importHmacKey, signJSON, verifyJSON } from "../lib/crypto";
 import { sendEmail } from "../lib/emailService";
 import { getValidAccessToken } from "./tokenManager";
 import { insertEvent, insertEventWithMeetLink, getCalendarTimeZone, fetchFreeBusy, type FreeBusyInterval } from "./googleCalendar";
@@ -29,10 +32,24 @@ import {
   findEmailVerification,
   countVerificationTargets,
   incrementVerificationAttempts,
+  createMeetingPoll,
+  findMeetingPoll,
+  findMeetingPollForUser,
+  createMeetingPollSlots,
+  listMeetingPollSlots,
+  castVote,
+  listVotesForPoll,
+  countDistinctParticipants,
+  tryClaimPollSlot,
+  finalizeMeetingPollBooking,
+  releasePollSlotClaim,
+  cancelOpenPoll,
   type TrustedInviteKind,
   type TrustedInviteRow,
   type AppointmentModality,
   type SchedulingSettingsRow,
+  type MeetingPollRow,
+  type MeetingPollSlotRow,
 } from "../db/schema";
 
 const INVITE_TTL_MS: Record<TrustedInviteKind, number> = {
@@ -49,6 +66,15 @@ const VERIFICATION_RESEND_COOLDOWN_MS = 60 * 1000;
 // Forwarding a link to a *few* alternate addresses is the intended use case;
 // an unbounded count turns one valid invite id into an open mail relay.
 const MAX_VERIFICATION_TARGETS_PER_INVITE = 5;
+// Caps total emails ever sent to one (invite, email) pair, independent of
+// the resend cooldown above — the cooldown alone never terminates (every
+// resend refreshes created_at, sliding the window forward forever; see
+// migration 0005's comment on email_verifications.sends), so over a poll
+// invite's 30-day TTL that's tens of thousands of sends to one address with
+// no other limit in place. Found in an independent security review of Phase
+// 7.3. 10 is generous for a legitimate participant needing a few retries
+// across the invite's full lifetime.
+const MAX_VERIFICATION_SENDS_PER_TARGET = 10;
 
 const EMAIL_FORMAT_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
@@ -62,6 +88,64 @@ function generateNumericCode(): string {
   // state elsewhere in this codebase.
   const n = crypto.getRandomValues(new Uint32Array(1))[0]! % 1_000_000;
   return n.toString().padStart(6, "0");
+}
+
+// Proves the caller has completed email verification for THIS specific
+// invite — set as a signed, HttpOnly, path-scoped cookie (routes/booking.tsx,
+// routes/pollVoting.tsx) once confirmEmailVerification succeeds, and checked
+// before rendering/accepting anything past the email-verify step. Closes a
+// real gap found in an independent security review of Phase 7.3: before
+// this, verification was tracked purely on the invite's own DB row
+// (status='verified'), so once *anyone* verified a link, anyone else who
+// later obtained the same URL — forwarded mail, a shared screenshot, a
+// mailing-list archive — could read and act on it with no proof of their
+// own inbox control, for as long as the invite stayed valid (up to 30 days
+// for a poll). The route layer additionally scopes the cookie's Path to
+// this exact invite (`/book/:id` / `/meet/:id`) so it's never even sent for
+// a different invite's requests, and callers here further require the
+// signed payload's inviteId to match, and its email to match the invite's
+// own recorded verified_email — closing the analogous gap where a *second*,
+// different email could independently pass its own code check (allowed by
+// confirmEmailVerification's existing 'verified'-status branch, unchanged
+// by this fix) and receive a valid cookie that then can't actually be used
+// for anything, rather than silently acting under the first verifier's
+// identity.
+export const INVITE_VERIFY_COOKIE = "trusted_invite_verify";
+
+interface InviteVerifyCookiePayload {
+  inviteId: string;
+  email: string;
+}
+
+export async function signInviteVerifyCookie(env: Env, inviteId: string, email: string): Promise<string> {
+  const key = await importHmacKey(env.SESSION_SECRET);
+  const payload: InviteVerifyCookiePayload = { inviteId, email };
+  return signJSON(key, payload);
+}
+
+// Returns the verified email if `cookieValue` is a validly-signed,
+// untampered cookie for exactly this inviteId — null for anything else
+// (missing, malformed, tampered, or scoped to a different invite). Callers
+// treat null as "not verified from this browser," regardless of what the
+// invite's own DB status says.
+export async function verifyInviteVerifyCookie(
+  env: Env,
+  inviteId: string,
+  cookieValue: string | undefined,
+): Promise<string | null> {
+  if (!cookieValue) return null;
+  const key = await importHmacKey(env.SESSION_SECRET);
+  const payload = await verifyJSON<InviteVerifyCookiePayload>(key, cookieValue);
+  if (!payload || payload.inviteId !== inviteId) return null;
+  return payload.email;
+}
+
+// Matches the cookie's lifetime to the invite kind's own TTL (see
+// INVITE_TTL_MS below) — long enough that a poll participant who verifies
+// once doesn't need to re-verify on every visit across the poll's full
+// voting window.
+export function inviteCookieMaxAgeSeconds(kind: TrustedInviteKind): number {
+  return Math.floor(INVITE_TTL_MS[kind] / 1000);
 }
 
 function isInviteReceivingVerification(invite: TrustedInviteRow, now = Date.now()): boolean {
@@ -141,6 +225,8 @@ export async function createInvite(env: Env, input: CreateInviteInput): Promise<
     }
     durationMinutes = input.durationMinutes;
     modality = input.modality;
+  } else if (!input.meetingPollId) {
+    throw new Error("createInvite: meetingPollId is required for kind='meeting_poll'");
   }
 
   const id = crypto.randomUUID();
@@ -179,7 +265,7 @@ export async function sendInviteEmail(
 
 export type RequestVerificationResult =
   | { ok: true }
-  | { ok: false; reason: "invite-not-available" | "invalid-email" | "cooldown" | "too-many-targets" };
+  | { ok: false; reason: "invite-not-available" | "invalid-email" | "cooldown" | "too-many-targets" | "send-failed" };
 
 // Three checks stand between this and being an unauthenticated "email
 // anyone, anytime" relay (all added in this project's post-commit security
@@ -204,6 +290,13 @@ export async function requestEmailVerification(
   if (existing && Date.now() - Date.parse(existing.created_at) < VERIFICATION_RESEND_COOLDOWN_MS) {
     return { ok: false, reason: "cooldown" };
   }
+  // Reuses the "cooldown" reason rather than a distinct one — an attacker
+  // probing for a send-count limit shouldn't get a different response shape
+  // than an ordinary too-soon resend; a legitimate caller sees the same
+  // "wait / check your inbox" message either way.
+  if (existing && existing.sends >= MAX_VERIFICATION_SENDS_PER_TARGET) {
+    return { ok: false, reason: "cooldown" };
+  }
   if (!existing) {
     const targetCount = await countVerificationTargets(env.DB, inviteId);
     if (targetCount >= MAX_VERIFICATION_TARGETS_PER_INVITE) {
@@ -212,6 +305,29 @@ export async function requestEmailVerification(
   }
 
   const code = generateNumericCode();
+  // Send before persisting the code hash, not after: a Resend outage/
+  // misconfiguration must degrade to a normal "couldn't send" response, not
+  // an uncaught exception reaching app.onError's bare 500 for a public,
+  // unauthenticated caller — the same class of gap
+  // computeAvailableSlots/confirmAppointmentBooking already guard against
+  // for Google failures (Phase 7.2), caught here for real during this
+  // phase's wrangler dev smoke test (a genuine 401 from Resend against a
+  // placeholder local API key), not hypothetical. Ordering matters beyond
+  // just catching the throw: writing the row *before* a failed send would
+  // also start the resend cooldown for a code the recipient never got,
+  // locking them out of retrying for no reason — sending first avoids that
+  // too, and a failed attempt leaves no row at all, so a later successful
+  // retry is a plain first-time upsert.
+  try {
+    await sendEmail(env, {
+      to: email,
+      subject: "Your verification code",
+      html: `<p>Your verification code is <strong>${code}</strong>. It expires in 10 minutes.</p>`,
+    });
+  } catch (err) {
+    console.error(`requestEmailVerification: send failed for invite ${inviteId}:`, err instanceof Error ? err.message : err);
+    return { ok: false, reason: "send-failed" };
+  }
   const codeHash = await sha256Hex(code);
   await upsertEmailVerification(env.DB, {
     id: crypto.randomUUID(),
@@ -219,11 +335,6 @@ export async function requestEmailVerification(
     email,
     codeHash,
     expiresAt: new Date(Date.now() + VERIFICATION_CODE_TTL_MS).toISOString(),
-  });
-  await sendEmail(env, {
-    to: email,
-    subject: "Your verification code",
-    html: `<p>Your verification code is <strong>${code}</strong>. It expires in 10 minutes.</p>`,
   });
   return { ok: true };
 }
@@ -348,24 +459,27 @@ function hasBufferedConflict(startMs: number, endMs: number, bufferMs: number, b
   });
 }
 
-// Only meaningful for invite.modality === 'remote'. Returns null if remote
-// meetings can't actually be completed right now — no Meet account
-// configured, or it's been disconnected/revoked since the invite was
-// created (createInvite already checks this at creation time; this is the
-// same check re-run, since settings can change afterward) — checked both
-// when offering slots and again at confirm time, so a broken Meet
-// configuration surfaces as "not available" rather than a Calendar API
-// error deep in the booking flow.
+// Only meaningful when the caller's modality is 'remote'. Returns null if
+// remote meetings can't actually be completed right now — no Meet account
+// configured, or it's been disconnected/revoked since the invite/poll was
+// created (createInvite/createMeetingPollWithSlots already check this at
+// creation time; this is the same check re-run, since settings can change
+// afterward) — checked both when offering slots and again at confirm/
+// finalize time, so a broken Meet configuration surfaces as "not available"
+// rather than a Calendar API error deep in the booking flow. Takes a plain
+// {userId, accountId} rather than a TrustedInviteRow so it's shared by both
+// the appointment path (invite.user_id/account_id) and the poll finalize
+// path (poll.user_id/account_id, no invite in scope at that point).
 async function resolveMeetAccessToken(
   env: Env,
-  invite: TrustedInviteRow,
+  owner: { userId: string; accountId: string },
   settings: SchedulingSettingsRow,
   primaryAccessToken: string,
 ): Promise<string | null> {
   if (!settings.meet_account_id) return null;
-  const meetAccount = await findAccountForUser(env.DB, invite.user_id, settings.meet_account_id);
+  const meetAccount = await findAccountForUser(env.DB, owner.userId, settings.meet_account_id);
   if (!meetAccount || meetAccount.status !== "active") return null;
-  return meetAccount.id === invite.account_id ? primaryAccessToken : getValidAccessToken(env, meetAccount.id);
+  return meetAccount.id === owner.accountId ? primaryAccessToken : getValidAccessToken(env, meetAccount.id);
 }
 
 // Creates a small helper event on the designated Meet account's own calendar
@@ -423,7 +537,7 @@ export async function computeAvailableSlots(env: Env, inviteId: string): Promise
   const windowEnd = now + AVAILABILITY_WINDOW_DAYS * 24 * 60 * 60 * 1000;
   try {
     accessToken = await getValidAccessToken(env, invite.account_id);
-    if (invite.modality === "remote" && !(await resolveMeetAccessToken(env, invite, settings, accessToken))) {
+    if (invite.modality === "remote" && !(await resolveMeetAccessToken(env, { userId: invite.user_id, accountId: invite.account_id }, settings, accessToken))) {
       return { ok: false, reason: "meet-unavailable" };
     }
     [timeZone, busy] = await Promise.all([
@@ -522,7 +636,7 @@ export async function confirmAppointmentBooking(env: Env, inviteId: string, star
       return { ok: false, reason: "slot-no-longer-available" };
     }
     if (invite.modality === "remote") {
-      meetAccessToken = await resolveMeetAccessToken(env, invite, settings, accessToken);
+      meetAccessToken = await resolveMeetAccessToken(env, { userId: invite.user_id, accountId: invite.account_id }, settings, accessToken);
       if (!meetAccessToken) return { ok: false, reason: "meet-unavailable" };
     }
   } catch (err) {
@@ -553,4 +667,352 @@ export async function confirmAppointmentBooking(env: Env, inviteId: string, star
 
   await recordAppointmentBooking(env.DB, inviteId, new Date(startMs).toISOString(), new Date(endMs).toISOString(), event.id);
   return { ok: true, googleEventId: event.id };
+}
+
+// --- Phase 7.3: multi-party meeting planner ---
+// A poll is one meeting_polls row plus a fixed set of owner-picked candidate
+// slots (meeting_poll_slots) and one trusted_invites row per participant
+// (kind='meeting_poll', meeting_poll_id -> the poll), reusing Phase 7.1's
+// email-verification lifecycle unchanged. The route layer creates those
+// per-participant invites itself, one createInvite/sendInviteEmail call per
+// email — the exact same per-email-isolated loop routes/invites.tsx already
+// uses for appointments — rather than this service doing it in bulk, so one
+// bad address in a pasted batch can't stop the rest (see routes/meetingPolls.tsx).
+
+const MIN_POLL_SLOTS = 2;
+const MAX_POLL_SLOTS = 20;
+
+export interface CreatePollInput {
+  userId: string;
+  accountId: string;
+  title: string;
+  durationMinutes: number;
+  modality: AppointmentModality;
+  // ISO UTC instants, owner-picked candidate start times — this feature has
+  // no free/busy-driven candidate generation (out of scope per task_plan.md
+  // Phase 7.3; that's what the appointment flow's computeAvailableSlots is
+  // for), so these come from the dashboard form as-is.
+  slotStarts: string[];
+}
+
+// Mirrors createInvite's owner-auth-only enforcement exactly (same two
+// checks, same reasoning: task_plan.md Phase 7's security model — invite/
+// poll creation is the one place trust originates, checked here independent
+// of whatever the route layer already checked) plus the same duration-range/
+// Meet-account validation createInvite applies for kind='appointment', since
+// a poll's duration/modality apply to every candidate slot the same way.
+export async function createMeetingPollWithSlots(env: Env, input: CreatePollInput): Promise<string> {
+  const account = await findAccountForUser(env.DB, input.userId, input.accountId);
+  if (!account) {
+    throw new Error(`createMeetingPollWithSlots: account ${input.accountId} does not belong to user ${input.userId}`);
+  }
+  if (account.status !== "active") {
+    throw new Error(`createMeetingPollWithSlots: account ${input.accountId} is not active (status: ${account.status})`);
+  }
+
+  const settings = await getOrCreateSchedulingSettings(env.DB, input.userId);
+  const allowed = allowedAppointmentDurations(settings);
+  if (!allowed.includes(input.durationMinutes)) {
+    throw new Error(`createMeetingPollWithSlots: durationMinutes must be one of ${allowed.join(", ")}`);
+  }
+  if (input.modality === "remote") {
+    if (!settings.meet_account_id) {
+      throw new Error("createMeetingPollWithSlots: remote meetings require a Meet account to be configured in Settings first");
+    }
+    const meetAccount = await findAccountForUser(env.DB, input.userId, settings.meet_account_id);
+    if (!meetAccount || meetAccount.status !== "active") {
+      throw new Error("createMeetingPollWithSlots: the configured Meet account is no longer active — update it in Settings");
+    }
+  }
+
+  const title = input.title.trim();
+  if (!title) throw new Error("createMeetingPollWithSlots: title is required");
+
+  // De-duped and filtered to distinct, parseable, future instants — mirrors
+  // parseEmailList's dedupe/trim conventions (routes/invites.tsx) applied to
+  // times instead of addresses. A poll needs at least MIN_POLL_SLOTS genuine
+  // options to be a poll at all (a single-candidate "poll" is really just an
+  // appointment invite with extra steps); MAX_POLL_SLOTS bounds the vote
+  // matrix a participant has to fill out and the rows finalize has to scan.
+  const now = Date.now();
+  const uniqueMs = Array.from(new Set(input.slotStarts.map((s) => Date.parse(s)).filter((ms) => !Number.isNaN(ms) && ms > now)));
+  if (uniqueMs.length < MIN_POLL_SLOTS) {
+    throw new Error(`createMeetingPollWithSlots: at least ${MIN_POLL_SLOTS} distinct future candidate times are required`);
+  }
+  if (uniqueMs.length > MAX_POLL_SLOTS) {
+    throw new Error(`createMeetingPollWithSlots: at most ${MAX_POLL_SLOTS} candidate times are allowed`);
+  }
+
+  const pollId = crypto.randomUUID();
+  await createMeetingPoll(env.DB, {
+    id: pollId,
+    userId: input.userId,
+    accountId: input.accountId,
+    title,
+    durationMinutes: input.durationMinutes,
+    modality: input.modality,
+  });
+  const durationMs = input.durationMinutes * 60 * 1000;
+  await createMeetingPollSlots(
+    env.DB,
+    uniqueMs
+      .sort((a, b) => a - b)
+      .map((ms) => ({
+        id: crypto.randomUUID(),
+        pollId,
+        startTime: new Date(ms).toISOString(),
+        endTime: new Date(ms + durationMs).toISOString(),
+      })),
+  );
+  return pollId;
+}
+
+export type PollLinkFailureReason =
+  | "not-found"
+  | "expired"
+  | "revoked"
+  | "not-a-poll-invite"
+  | "poll-cancelled"
+  | "poll-concluded";
+
+export type PollLinkResult =
+  | { ok: true; invite: TrustedInviteRow; poll: MeetingPollRow; slots: MeetingPollSlotRow[] }
+  | { ok: false; reason: PollLinkFailureReason };
+
+// A finalized poll's link stays valid for viewing (not voting — the route
+// layer branches on poll.status) only until the booked meeting's own end
+// time — same "time-based expiry against the chosen slot's end time, not a
+// fixed TTL/single use" rule as task_plan.md Phase 7.3 specifies, layered on
+// top of (not replacing) the invite's own creation-time TTL that
+// getUsableInvite already enforces.
+function isPollLinkExpired(poll: MeetingPollRow, now = Date.now()): boolean {
+  if (poll.status !== "finalized") return false;
+  return poll.booked_end == null || Date.parse(poll.booked_end) <= now;
+}
+
+export async function getPollForInvite(env: Env, inviteId: string): Promise<PollLinkResult> {
+  const usable = await getUsableInvite(env, inviteId);
+  if (!usable.invite) return { ok: false, reason: usable.reason };
+  const invite = usable.invite;
+  if (invite.kind !== "meeting_poll" || !invite.meeting_poll_id) {
+    return { ok: false, reason: "not-a-poll-invite" };
+  }
+  const poll = await findMeetingPoll(env.DB, invite.meeting_poll_id);
+  if (!poll) return { ok: false, reason: "not-found" };
+  if (poll.status === "cancelled") return { ok: false, reason: "poll-cancelled" };
+  if (isPollLinkExpired(poll)) return { ok: false, reason: "poll-concluded" };
+  const slots = await listMeetingPollSlots(env.DB, invite.meeting_poll_id);
+  return { ok: true, invite, poll, slots };
+}
+
+export type CastVotesResult = { ok: true } | { ok: false; reason: "invite-not-available" | "poll-not-open" | "invalid-slot" };
+
+// Identity is the invite's own verified_email — the same address that
+// completed email verification for *this* invite link, not a value the
+// caller supplies separately — so a participant can only ever vote as
+// themselves, matching the appointment flow's "identity is proven by
+// verifying this address" model exactly.
+//
+// Validates every slotId before writing any vote, not per-item as it goes —
+// a partially-applied vote submission (some slots written, then a bad id
+// aborts) would be a confusing half-state for a form that's meant to be
+// resubmittable as a whole.
+export async function castPollVotes(env: Env, inviteId: string, votes: Record<string, boolean>): Promise<CastVotesResult> {
+  const result = await getPollForInvite(env, inviteId);
+  if (!result.ok) return { ok: false, reason: "invite-not-available" };
+  const { invite, poll, slots } = result;
+  if (invite.status !== "verified" || !invite.verified_email) {
+    return { ok: false, reason: "invite-not-available" };
+  }
+  if (poll.status !== "open") return { ok: false, reason: "poll-not-open" };
+
+  const slotIds = new Set(slots.map((s) => s.id));
+  const entries = Object.entries(votes);
+  for (const [slotId] of entries) {
+    if (!slotIds.has(slotId)) return { ok: false, reason: "invalid-slot" };
+  }
+  for (const [slotId, available] of entries) {
+    await castVote(env.DB, poll.id, slotId, invite.verified_email, available);
+  }
+  return { ok: true };
+}
+
+export interface PollTallySlot {
+  slot: MeetingPollSlotRow;
+  availableCount: number;
+  fullyAvailable: boolean;
+}
+export interface PollTally {
+  totalParticipants: number;
+  slots: PollTallySlot[];
+}
+
+// Owner-facing live tally (routes/meetingPolls.tsx) — computed in
+// application code from the raw vote rows rather than a SQL aggregation:
+// poll sizes here are small (MAX_POLL_SLOTS=20 slots x realistically a
+// handful of participants), and this keeps "how many distinct participants
+// have voted at all" (the denominator) and "is every one of them available
+// on this slot" (fullyAvailable) expressed in one place, matching
+// findFullyAvailableSlot below exactly rather than two SQL queries that
+// could silently drift apart from each other.
+export async function getPollTally(env: Env, pollId: string): Promise<PollTally> {
+  const [slots, votes, totalParticipants] = await Promise.all([
+    listMeetingPollSlots(env.DB, pollId),
+    listVotesForPoll(env.DB, pollId),
+    countDistinctParticipants(env.DB, pollId),
+  ]);
+  return {
+    totalParticipants,
+    slots: slots.map((slot) => {
+      const availableCount = votes.filter((v) => v.slot_id === slot.id && v.available === 1).length;
+      return { slot, availableCount, fullyAvailable: totalParticipants > 0 && availableCount === totalParticipants };
+    }),
+  };
+}
+
+// The slot every distinct participant marked available, if one exists.
+// Ties (more than one fully-available slot) resolve to the chronologically
+// earliest — listMeetingPollSlots already returns slots ordered by
+// start_time ASC, so the first *future* match found is that slot; a
+// deliberate, simple tie-break (not asked for explicitly in task_plan.md's
+// spec) rather than surfacing a choice back to the owner for what's expected
+// to be a rare case.
+//
+// Filters to slots strictly after `now` — without this, a poll left open
+// past all its candidate times (nobody ever finalized it) would book a real
+// calendar event *in the past* the moment someone finally clicked Finalize,
+// and — worse — the tie-break above meant it always picked the *stalest*
+// fully-available candidate, not even the most-recently-past one. Found in
+// an independent security review of Phase 7.3, reproduced with a poll whose
+// only fully-available slots were both already past. `onlyPastAvailable`
+// lets finalizePoll report a distinct, honest reason ("every viable
+// candidate has already passed") instead of the misleading
+// "no-fully-available-slot" (which reads as "nobody agreed on anything").
+async function findFullyAvailableSlot(
+  env: Env,
+  pollId: string,
+  now = Date.now(),
+): Promise<{ winner: MeetingPollSlotRow | null; onlyPastAvailable: boolean }> {
+  const tally = await getPollTally(env, pollId);
+  const fullyAvailable = tally.slots.filter((s) => s.fullyAvailable);
+  const future = fullyAvailable.find((s) => Date.parse(s.slot.start_time) > now);
+  return { winner: future?.slot ?? null, onlyPastAvailable: !future && fullyAvailable.length > 0 };
+}
+
+export type FinalizePollResult =
+  | { ok: true; googleEventId: string }
+  | {
+      ok: false;
+      reason:
+        | "poll-not-found"
+        | "poll-not-open"
+        | "no-fully-available-slot"
+        | "all-candidates-in-the-past"
+        | "meet-unavailable"
+        | "calendar-unavailable"
+        | "cancelled-during-finalize";
+    };
+
+// Owner-only — the route layer requireAuth-gates this and findMeetingPollForUser
+// re-verifies pollId actually belongs to userId (same defense-in-depth
+// pattern as createInvite/createMeetingPollWithSlots).
+//
+// Ordering mirrors confirmAppointmentBooking exactly, adapted for the fact
+// that finalizing writes chosen_slot_id/status together rather than a
+// single-use consume: everything read-only (access token, timezone,
+// resolving the Meet account) happens before tryClaimPollSlot; the atomic
+// claim happens next (closing the race between two concurrent finalize
+// calls); the real Google writes (Meet room, placeholder event) happen only
+// after the claim succeeds; finalizeMeetingPollBooking — the second, final
+// write — happens last. See migration 0007's CHECK comment for why the claim
+// and the finalize-write are two separate updates instead of one.
+export async function finalizePoll(env: Env, userId: string, pollId: string): Promise<FinalizePollResult> {
+  const poll = await findMeetingPollForUser(env.DB, userId, pollId);
+  if (!poll) return { ok: false, reason: "poll-not-found" };
+  if (poll.status !== "open") return { ok: false, reason: "poll-not-open" };
+
+  const { winner: winningSlot, onlyPastAvailable } = await findFullyAvailableSlot(env, pollId);
+  if (!winningSlot) return { ok: false, reason: onlyPastAvailable ? "all-candidates-in-the-past" : "no-fully-available-slot" };
+
+  const settings = await getOrCreateSchedulingSettings(env.DB, userId);
+  const startMs = Date.parse(winningSlot.start_time);
+  const endMs = Date.parse(winningSlot.end_time);
+
+  let accessToken: string;
+  let timeZone: string;
+  let meetAccessToken: string | null = null;
+  try {
+    accessToken = await getValidAccessToken(env, poll.account_id);
+    timeZone = await getCalendarTimeZone(accessToken);
+    if (poll.modality === "remote") {
+      meetAccessToken = await resolveMeetAccessToken(env, { userId: poll.user_id, accountId: poll.account_id }, settings, accessToken);
+      if (!meetAccessToken) return { ok: false, reason: "meet-unavailable" };
+    }
+  } catch (err) {
+    console.error(`finalizePoll: Google Calendar access failed for poll ${pollId}:`, err instanceof Error ? err.message : err);
+    return { ok: false, reason: "calendar-unavailable" };
+  }
+
+  const claimed = await tryClaimPollSlot(env.DB, pollId, winningSlot.id);
+  if (!claimed) return { ok: false, reason: "poll-not-open" }; // lost a race, or already claimed
+
+  // The two real Google writes happen only after the claim succeeds (see
+  // migration 0007's CHECK comment for the full ordering rationale) — but
+  // unlike confirmAppointmentBooking's single-use tryConsumeInvite, a claim
+  // failure here is recoverable, not a dead invite: release it back to
+  // 'open' so a later finalize attempt (after the owner clicks the button
+  // again, or Google recovers) isn't permanently blocked by
+  // tryClaimPollSlot's own "chosen_slot_id IS NULL" requirement. Found in an
+  // independent security review of Phase 7.3 — this exact gap (missing
+  // try/catch around a Google write, no release path) was already fixed
+  // once for requestEmailVerification/computeAvailableSlots in Phase 7.1/7.2
+  // and was reintroduced here.
+  let event: { id: string };
+  try {
+    const meetUrl = meetAccessToken ? await mintMeetLink(meetAccessToken, startMs, endMs) : null;
+    // Same generic-placeholder-only rule as confirmAppointmentBooking — no
+    // participant- or owner-supplied poll title is ever written to the real
+    // calendar, only the system-generated Meet link when applicable.
+    event = await insertEvent(accessToken, {
+      summary: "Busy (booked via invite)",
+      ...(meetUrl ? { description: `Join: ${meetUrl}` } : {}),
+      start: { dateTime: new Date(startMs).toISOString(), timeZone },
+      end: { dateTime: new Date(endMs).toISOString(), timeZone },
+      transparency: "opaque",
+    });
+  } catch (err) {
+    console.error(`finalizePoll: Google Calendar write failed after claiming a slot for poll ${pollId}:`, err instanceof Error ? err.message : err);
+    await releasePollSlotClaim(env.DB, pollId);
+    return { ok: false, reason: "calendar-unavailable" };
+  }
+
+  const finalized = await finalizeMeetingPollBooking(
+    env.DB,
+    pollId,
+    winningSlot.id,
+    new Date(startMs).toISOString(),
+    new Date(endMs).toISOString(),
+    event.id,
+  );
+  if (!finalized) {
+    // Lost a race against cancelOpenPoll, which can still succeed between
+    // the claim above and this write (the claim deliberately leaves status
+    // 'open' — see tryClaimPollSlot's comment). The real calendar event
+    // (and Meet room, if any) was already created and is now orphaned —
+    // logged so the owner can be told to remove it by hand, matching this
+    // codebase's existing accepted-tradeoff bar for post-claim failures
+    // (see confirmAppointmentBooking's own documented one) rather than a
+    // saga/rollback mechanism.
+    console.error(
+      `finalizePoll: poll ${pollId} was cancelled mid-finalize — real calendar event ${event.id} was created and is now orphaned; remove it by hand.`,
+    );
+    return { ok: false, reason: "cancelled-during-finalize" };
+  }
+  return { ok: true, googleEventId: event.id };
+}
+
+export async function cancelPoll(env: Env, userId: string, pollId: string): Promise<boolean> {
+  const poll = await findMeetingPollForUser(env.DB, userId, pollId);
+  if (!poll) return false;
+  return cancelOpenPoll(env.DB, pollId);
 }

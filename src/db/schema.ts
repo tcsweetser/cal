@@ -563,6 +563,7 @@ export interface EmailVerificationRow {
   email: string;
   code_hash: string;
   attempts: number;
+  sends: number;
   expires_at: string;
   created_at: string;
 }
@@ -580,16 +581,21 @@ export interface UpsertEmailVerificationInput {
 // leaves `attempts` untouched on conflict (no `attempts = 0` in the DO
 // UPDATE) — a resend must not reset the lockout counter, only the
 // code/expiry, otherwise the 5-attempt cap becomes bypassable by just
-// requesting a new code (the actual bug this fixes).
+// requesting a new code (the actual bug this fixes). `sends` is incremented
+// on every call (initial INSERT starts at 1, not 0) — a second, independent
+// lifetime cap (MAX_VERIFICATION_SENDS_PER_TARGET, trustedAccess.ts) on top
+// of the per-resend cooldown, since the cooldown alone never actually
+// terminates (see migration 0005's comment on this table).
 export async function upsertEmailVerification(db: D1Database, input: UpsertEmailVerificationInput): Promise<void> {
   await db
     .prepare(
-      `INSERT INTO email_verifications (id, invite_id, email, code_hash, expires_at)
-       VALUES (?, ?, ?, ?, ?)
+      `INSERT INTO email_verifications (id, invite_id, email, code_hash, expires_at, sends)
+       VALUES (?, ?, ?, ?, ?, 1)
        ON CONFLICT(invite_id, email) DO UPDATE SET
          code_hash = excluded.code_hash,
          expires_at = excluded.expires_at,
-         created_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')`,
+         created_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+         sends = sends + 1`,
     )
     .bind(input.id, input.inviteId, input.email, input.codeHash, input.expiresAt)
     .run();
@@ -707,4 +713,228 @@ export async function updateSchedulingSettings(
       input.meetAccountId,
     )
     .run();
+}
+
+// --- Meeting polls (Phase 7.3, see task_plan.md) ---
+
+export type MeetingPollStatus = "open" | "finalized" | "cancelled";
+
+export interface MeetingPollRow {
+  id: string;
+  user_id: string;
+  account_id: string;
+  title: string;
+  duration_minutes: number;
+  modality: AppointmentModality;
+  status: MeetingPollStatus;
+  chosen_slot_id: string | null;
+  booked_start: string | null;
+  booked_end: string | null;
+  google_event_id: string | null;
+  created_at: string;
+}
+
+export interface CreateMeetingPollInput {
+  id: string;
+  userId: string;
+  accountId: string;
+  title: string;
+  durationMinutes: number;
+  modality: AppointmentModality;
+}
+
+export async function createMeetingPoll(db: D1Database, input: CreateMeetingPollInput): Promise<void> {
+  await db
+    .prepare(
+      `INSERT INTO meeting_polls (id, user_id, account_id, title, duration_minutes, modality)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+    )
+    .bind(input.id, input.userId, input.accountId, input.title, input.durationMinutes, input.modality)
+    .run();
+}
+
+export function findMeetingPoll(db: D1Database, id: string): Promise<MeetingPollRow | null> {
+  return db.prepare("SELECT * FROM meeting_polls WHERE id = ?").bind(id).first<MeetingPollRow>();
+}
+
+// Scoped by both id and user_id, same reasoning as findAccountForUser above —
+// the dashboard poll-detail/finalize routes (requireAuth-gated) must never be
+// able to act on another user's poll just because they guessed/enumerated an id.
+export function findMeetingPollForUser(db: D1Database, userId: string, id: string): Promise<MeetingPollRow | null> {
+  return db
+    .prepare("SELECT * FROM meeting_polls WHERE id = ? AND user_id = ?")
+    .bind(id, userId)
+    .first<MeetingPollRow>();
+}
+
+export async function listMeetingPollsForUser(db: D1Database, userId: string): Promise<MeetingPollRow[]> {
+  const { results } = await db
+    .prepare("SELECT * FROM meeting_polls WHERE user_id = ? ORDER BY created_at DESC")
+    .bind(userId)
+    .all<MeetingPollRow>();
+  return results;
+}
+
+// Atomic compare-and-swap, same shape as tryConsumeInvite/tryStartSyncLog:
+// only succeeds if the poll is 'open' and no slot has been claimed yet,
+// closing the race where two near-simultaneous finalize calls (e.g. a double
+// form submit) could both proceed to write a real Meet room / calendar
+// event. Deliberately a separate step from finalizeMeetingPollBooking below
+// — see migration 0007's CHECK comment for why the two are split rather than
+// one atomic UPDATE that also sets status='finalized'.
+export async function tryClaimPollSlot(db: D1Database, pollId: string, slotId: string): Promise<boolean> {
+  const result = await db
+    .prepare("UPDATE meeting_polls SET chosen_slot_id = ? WHERE id = ? AND status = 'open' AND chosen_slot_id IS NULL")
+    .bind(slotId, pollId)
+    .run();
+  return result.meta.changes === 1;
+}
+
+// Called only after tryClaimPollSlot succeeded and the real Meet room /
+// calendar event write (finalizePoll, trustedAccess.ts) has itself
+// succeeded — see that function for the full ordering rationale. Guarded on
+// `status = 'open' AND chosen_slot_id = ?`, not just `id = ?` — the claim
+// deliberately leaves status 'open' (see tryClaimPollSlot's comment), which
+// means cancelOpenPoll's own `WHERE status = 'open'` can still succeed
+// *during* the real Google writes between the claim and this call. Without
+// this guard, this UPDATE would silently overwrite a cancellation that
+// landed in that window back to 'finalized' — found in an independent
+// security review of Phase 7.3, reproduced by cancelling from inside a
+// mocked Google call and observing the poll end up 'finalized' anyway with
+// a real google_event_id. Returns whether the write actually took, so
+// finalizePoll can tell a genuine finalize apart from one that lost this
+// race.
+export async function finalizeMeetingPollBooking(
+  db: D1Database,
+  pollId: string,
+  slotId: string,
+  bookedStart: string,
+  bookedEnd: string,
+  googleEventId: string,
+): Promise<boolean> {
+  const result = await db
+    .prepare(
+      "UPDATE meeting_polls SET status = 'finalized', booked_start = ?, booked_end = ?, google_event_id = ? WHERE id = ? AND status = 'open' AND chosen_slot_id = ?",
+    )
+    .bind(bookedStart, bookedEnd, googleEventId, pollId, slotId)
+    .run();
+  return result.meta.changes === 1;
+}
+
+// Releases a claimed-but-not-yet-finalized slot back to 'open' — called only
+// when the real Google writes between tryClaimPollSlot and
+// finalizeMeetingPollBooking fail (finalizePoll, trustedAccess.ts), so a
+// transient Calendar API error doesn't permanently brick the poll (chosen_
+// slot_id would otherwise stay set forever, and tryClaimPollSlot's CAS
+// requires it NULL to claim again). Guarded the same way tryClaimPollSlot
+// claims — only touches a still-'open' poll, so it can't un-cancel a poll
+// that was cancelled in the same window this is racing to recover from.
+export async function releasePollSlotClaim(db: D1Database, pollId: string): Promise<void> {
+  await db.prepare("UPDATE meeting_polls SET chosen_slot_id = NULL WHERE id = ? AND status = 'open'").bind(pollId).run();
+}
+
+// Owner-only (route layer requireAuth-gates this, findMeetingPollForUser
+// re-verifies ownership). Only a still-'open' poll can be cancelled — a
+// finalized poll already has a real calendar event and cancelling *that*
+// would need to also delete the event, out of scope for this feature (the
+// owner can just delete the event directly on their calendar, same as any
+// other event this codebase creates).
+export async function cancelOpenPoll(db: D1Database, id: string): Promise<boolean> {
+  const result = await db.prepare("UPDATE meeting_polls SET status = 'cancelled' WHERE id = ? AND status = 'open'").bind(id).run();
+  return result.meta.changes === 1;
+}
+
+export interface MeetingPollSlotRow {
+  id: string;
+  poll_id: string;
+  start_time: string;
+  end_time: string;
+  created_at: string;
+}
+
+export interface CreateMeetingPollSlotInput {
+  id: string;
+  pollId: string;
+  startTime: string;
+  endTime: string;
+}
+
+export async function createMeetingPollSlots(db: D1Database, inputs: CreateMeetingPollSlotInput[]): Promise<void> {
+  if (inputs.length === 0) return;
+  const stmt = db.prepare("INSERT INTO meeting_poll_slots (id, poll_id, start_time, end_time) VALUES (?, ?, ?, ?)");
+  await db.batch(inputs.map((s) => stmt.bind(s.id, s.pollId, s.startTime, s.endTime)));
+}
+
+export async function listMeetingPollSlots(db: D1Database, pollId: string): Promise<MeetingPollSlotRow[]> {
+  const { results } = await db
+    .prepare("SELECT * FROM meeting_poll_slots WHERE poll_id = ? ORDER BY start_time ASC")
+    .bind(pollId)
+    .all<MeetingPollSlotRow>();
+  return results;
+}
+
+export interface MeetingPollVoteRow {
+  id: string;
+  poll_id: string;
+  slot_id: string;
+  participant_email: string;
+  available: number;
+  created_at: string;
+  updated_at: string;
+}
+
+// UPSERT, not INSERT: a participant's vote is resubmittable up until the
+// poll is finalized (task_plan.md Phase 7.3) — at most one row per (slot,
+// participant), per the unique index in migration 0007, so a changed vote
+// overwrites in place rather than accumulating a history this codebase has
+// no use for.
+export async function castVote(
+  db: D1Database,
+  pollId: string,
+  slotId: string,
+  participantEmail: string,
+  available: boolean,
+): Promise<void> {
+  await db
+    .prepare(
+      `INSERT INTO meeting_poll_votes (id, poll_id, slot_id, participant_email, available)
+       VALUES (?, ?, ?, ?, ?)
+       ON CONFLICT(slot_id, participant_email) DO UPDATE SET available = excluded.available`,
+    )
+    .bind(crypto.randomUUID(), pollId, slotId, participantEmail, available ? 1 : 0)
+    .run();
+}
+
+export async function listVotesForPoll(db: D1Database, pollId: string): Promise<MeetingPollVoteRow[]> {
+  const { results } = await db
+    .prepare("SELECT * FROM meeting_poll_votes WHERE poll_id = ?")
+    .bind(pollId)
+    .all<MeetingPollVoteRow>();
+  return results;
+}
+
+export async function listVotesForParticipant(
+  db: D1Database,
+  pollId: string,
+  participantEmail: string,
+): Promise<MeetingPollVoteRow[]> {
+  const { results } = await db
+    .prepare("SELECT * FROM meeting_poll_votes WHERE poll_id = ? AND participant_email = ?")
+    .bind(pollId, participantEmail)
+    .all<MeetingPollVoteRow>();
+  return results;
+}
+
+// Distinct participants who have voted on *any* slot in this poll — the
+// denominator for "is every participant available on this slot" (a slot
+// needs an `available=1` vote from each of these, not just a majority; see
+// findFullyAvailableSlot, trustedAccess.ts). Deliberately not derived from
+// trusted_invites (kind='meeting_poll', meeting_poll_id=this poll) — a sent
+// invite that was never verified/voted shouldn't block finalization forever.
+export async function countDistinctParticipants(db: D1Database, pollId: string): Promise<number> {
+  const row = await db
+    .prepare("SELECT COUNT(DISTINCT participant_email) AS n FROM meeting_poll_votes WHERE poll_id = ?")
+    .bind(pollId)
+    .first<{ n: number }>();
+  return row?.n ?? 0;
 }

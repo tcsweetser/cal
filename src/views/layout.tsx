@@ -24,9 +24,9 @@ const css = `
   th, td { text-align: left; padding: 0.5rem 0.75rem; border-bottom: 1px solid light-dark(#e5e5e5, #2a2a2a); }
   th { font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.03em; opacity: 0.7; }
   .badge { display: inline-block; padding: 0.15rem 0.5rem; border-radius: 999px; font-size: 0.78rem; font-weight: 600; }
-  .badge-active, .badge-success { background: light-dark(#e6f4ea, #1c3324); color: light-dark(#1e7e34, #6fcf97); }
-  .badge-revoked, .badge-error { background: light-dark(#fdecea, #3a1f1f); color: light-dark(#c0392b, #ff6b5f); }
-  .badge-in_progress { background: light-dark(#fff8e1, #3a3320); color: light-dark(#b8860b, #e0c060); }
+  .badge-active, .badge-success, .badge-finalized { background: light-dark(#e6f4ea, #1c3324); color: light-dark(#1e7e34, #6fcf97); }
+  .badge-revoked, .badge-error, .badge-cancelled { background: light-dark(#fdecea, #3a1f1f); color: light-dark(#c0392b, #ff6b5f); }
+  .badge-in_progress, .badge-open { background: light-dark(#fff8e1, #3a3320); color: light-dark(#b8860b, #e0c060); }
   form.inline { display: inline; }
   button, .button {
     font: inherit; padding: 0.5rem 1rem; border-radius: 6px; border: 1px solid light-dark(#ccc, #444);
@@ -51,6 +51,7 @@ export const Layout: FC<PropsWithChildren<{ title: string }>> = ({ title, childr
         <a href="/dashboard/mappings">Roles &amp; Tags</a>
         <a href="/dashboard/logs">Sync Logs</a>
         <a href="/dashboard/invites">Invites</a>
+        <a href="/dashboard/meeting-polls">Meeting Polls</a>
         <a href="/dashboard/settings">Settings</a>
         {/* POST, not a GET link — link prefetchers/crawlers/preview-fetchers
             following a GET /auth/logout would silently log the user out. */}

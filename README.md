@@ -6,7 +6,7 @@ Open-source, edge-deployed system that keeps multiple Google Calendar accounts (
 
 ✅ **Feature-complete and deployed in production.** Skeleton, DB schema, Google OAuth + encrypted token storage + sessions, the sync engine and cron handler, and the dashboard are all built, verified, and running live against 5 real Google accounts (1 primary + 4 secondary), replicating real events end to end — including creates, deletes/cancellations, and recurring events. See `task_plan.md` for the full build and incident history, including two production issues found and fixed after the initial deploy (a Workers subrequest-limit overrun on first full sync, and an unbounded incremental-sync gap for indefinitely-recurring events).
 
-Full implementation plan and progress tracking: [`task_plan.md`](task_plan.md).
+Full implementation plan and progress tracking: [`task_plan.md`](task_plan.md). For a full from-scratch deployment walkthrough (Google Cloud Console OAuth setup, Cloudflare provisioning, secrets, troubleshooting), see [`DEPLOYMENT.md`](DEPLOYMENT.md).
 
 ## How it works
 
@@ -29,6 +29,16 @@ Once logged in as the primary account:
 - **`/dashboard/mappings`** — read-only role/tag overview for every linked account. Tags are fixed at connect time (`accounts.tag` is required from the moment the row is created), so there's nothing to edit here.
 - **`/dashboard/logs`** — sync run history, and a "Run sync now" button (`POST /api/trigger-sync`).
 - **`/auth/logout`** — clears the session.
+
+## Trusted-party booking
+
+Beyond calendar-to-calendar sync, the primary account can let a third party book time directly, without ever seeing a Google login or getting write access to any calendar. Both flows are HTML-only, public, unauthenticated routes — no JSON API surface — and require the primary account's own login to originate; nothing can be created anonymously.
+
+- **`/dashboard/invites`** (login required) — paste one or more emails, pick an account and duration/modality (in-person or remote), and send each an invite. Settings (allowed duration range, buffer between meetings, bookable hours, and which connected account mints Google Meet links for remote bookings) live at **`/dashboard/settings`**.
+- **`/book/:id`** (public) — the appointment-dialog link an invited email receives: verify the email with a one-time code, then pick from real available time slots (computed from the target calendar's actual free/busy data, respecting the configured buffer and bookable-hours window) and confirm. Booking writes a generic placeholder event (no attendee-supplied detail) to the target calendar; a remote booking also mints a Google Meet link via the designated Meet account and embeds it in the event description.
+- **`/dashboard/meeting-polls`** (login required) — coordinate across multiple parties instead of one: propose several candidate time slots, paste participant emails, and each gets an invite to vote their availability. A poll stays open (participants can change their vote) until you finalize it.
+- **`/meet/:id`** (public) — the meeting-poll link a participant receives: verify by email, then mark availability for each candidate slot; resubmittable any time before the poll is finalized. Once finalized, the earliest fully-available slot (every participant marked available) is booked the same way as an appointment, remote/Meet included. The link itself stays valid through the end of the booked meeting, not just until first use.
+- Every verification code is single-use, rate-limited, and hashed at rest; invite links carry an unguessable id and a 30-day creation-time expiry independent of the flows above. See `task_plan.md`'s Phase 7 entries for the full design, including a post-commit security review that found and fixed 3 real issues (open mail relay, rate-limit bypass, and a status-check gap) before this shipped further.
 
 ## Tech stack
 

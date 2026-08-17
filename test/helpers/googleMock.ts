@@ -36,6 +36,11 @@ export class GoogleCalendarMock {
   // originEventIds whose insert should always 500 (see the POST handler) —
   // simulates an event that can never be created, for per-event isolation tests.
   private poisonedOriginEventIds = new Set<string>();
+  // Unlike poisonedOriginEventIds (keyed off sync-engine metadata a booking/
+  // poll insert never sets), this fails *every* insert regardless of body —
+  // for tests simulating a Google failure on the one-off placeholder events
+  // trustedAccess.ts writes (no originEventId to key off of).
+  private poisonAllInserts_ = false;
   // What the next events.instances() call for a given (accessToken,
   // recurringEventId) pair should return — used by the daily recurring
   // audit's tests (runDailyRecurringAudit, syncEngine.ts). Keyed same as
@@ -79,6 +84,10 @@ export class GoogleCalendarMock {
     this.poisonedOriginEventIds.add(originEventId);
   }
 
+  poisonAllInserts() {
+    this.poisonAllInserts_ = true;
+  }
+
   setCalendarTimeZone(accessToken: string, timeZone: string) {
     this.calendarTimeZones.set(accessToken, timeZone);
   }
@@ -115,6 +124,9 @@ export class GoogleCalendarMock {
       }
 
       if (url.origin + url.pathname === EVENTS_URL && method === "POST") {
+        if (this.poisonAllInserts_) {
+          return new Response("Internal Server Error", { status: 500 });
+        }
         const body = JSON.parse(String(init?.body)) as {
           extendedProperties?: { private?: { originEventId?: string } };
           conferenceData?: { createRequest?: { requestId?: string } };

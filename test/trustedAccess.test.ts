@@ -149,6 +149,31 @@ it("getUsableInvite reports a not-found invite distinctly from a real one", asyn
 
 // --- Regressions for the post-commit security review (see task_plan.md Phase 7.1) ---
 
+it("degrades gracefully (not a 500) when the email provider fails, and doesn't start a resend cooldown for a code that was never delivered — caught for real during Phase 7.3's wrangler dev smoke test", async () => {
+  const { userId, account } = await setup();
+  const id = await createInvite(env, { userId, accountId: account.id, kind: "appointment", inviteeEmail: "invitee@example.com", durationMinutes: 30, modality: "in_person" });
+
+  // Persistent failure, not makeNextSendFail's single-shot one: resendFetch
+  // (emailService.ts) retries 429/5xx internally, so a one-shot failure gets
+  // silently absorbed by a successful retry — this needs every attempt to
+  // fail to actually exercise a fully-exhausted send. Fake timers skip the
+  // real backoff sleeps between those retry attempts.
+  mock.makeAllSendsFail();
+  vi.useFakeTimers();
+  const failedPromise = requestEmailVerification(env, id, "invitee@example.com");
+  await vi.runAllTimersAsync();
+  const failed = await failedPromise;
+  expect(failed).toEqual({ ok: false, reason: "send-failed" });
+  vi.useRealTimers();
+  mock.stopFailingAllSends();
+
+  // No cooldown lock and no dangling verification row from the failed
+  // attempt — a normal retry immediately after must succeed outright.
+  const retried = await requestEmailVerification(env, id, "invitee@example.com");
+  expect(retried).toEqual({ ok: true });
+  expect(mock.sends).toHaveLength(1);
+});
+
 it("refuses to send a verification code against a nonexistent invite id (was an open mail relay)", async () => {
   const result = await requestEmailVerification(env, "does-not-exist", "victim@example.com");
   expect(result).toEqual({ ok: false, reason: "invite-not-available" });
@@ -209,6 +234,33 @@ it("a resend does not reset the attempt lockout (was a full rate-limit bypass)",
   // is rejected, because `attempts` was never reset by the resend.
   const stillLocked = await confirmEmailVerification(env, id, "invitee@example.com", secondCode);
   expect(stillLocked).toEqual({ ok: false, reason: "too-many-attempts" });
+});
+
+// Regression: an independent security review of Phase 7.3 found that the
+// resend cooldown above never actually terminates — every resend refreshes
+// created_at, sliding the 60s window forward forever rather than ending it
+// — so nothing capped the *total* number of emails one (invite, email) pair
+// could ever receive. Backdates created_at directly (same technique as the
+// lockout test above) rather than a real 60s wait per iteration.
+it("caps total emails sent to one address over an invite's lifetime, independent of (and in addition to) the resend cooldown", async () => {
+  const { userId, account } = await setup();
+  const id = await createInvite(env, { userId, accountId: account.id, kind: "appointment", inviteeEmail: "invitee@example.com", durationMinutes: 30, modality: "in_person" });
+
+  for (let i = 0; i < 10; i++) {
+    const result = await requestEmailVerification(env, id, "invitee@example.com");
+    expect(result).toEqual({ ok: true });
+    await env.DB.prepare("UPDATE email_verifications SET created_at = '2000-01-01T00:00:00.000Z' WHERE invite_id = ? AND email = ?")
+      .bind(id, "invitee@example.com")
+      .run();
+  }
+  expect(mock.sends).toHaveLength(10);
+
+  const eleventh = await requestEmailVerification(env, id, "invitee@example.com");
+  // Reuses the "cooldown" reason rather than a distinct one — an attacker
+  // probing for a lifetime-cap error shouldn't learn anything a normal
+  // too-soon resend wouldn't also tell them.
+  expect(eleventh).toEqual({ ok: false, reason: "cooldown" });
+  expect(mock.sends).toHaveLength(10); // no 11th send, even though the cooldown alone was cleared
 });
 
 it("refuses to create an invite against another user's account (security model: invite creation is the one place trust originates)", async () => {

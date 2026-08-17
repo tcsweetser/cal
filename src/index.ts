@@ -7,6 +7,8 @@ import publicRoutes from "./routes/public";
 import invitesRoutes from "./routes/invites";
 import bookingRoutes from "./routes/booking";
 import settingsRoutes from "./routes/settings";
+import meetingPollsRoutes from "./routes/meetingPolls";
+import pollVotingRoutes from "./routes/pollVoting";
 import { listUserIds } from "./db/schema";
 import { runFullSync, runDailyRecurringAudit } from "./services/syncEngine";
 
@@ -28,6 +30,8 @@ app.route("/", publicRoutes);
 app.route("/", invitesRoutes);
 app.route("/", bookingRoutes);
 app.route("/", settingsRoutes);
+app.route("/", meetingPollsRoutes);
+app.route("/", pollVotingRoutes);
 
 // Without this, an uncaught error is Hono's bare default 500 with nothing
 // logged — with `observability` enabled (wrangler.jsonc), a console.error
