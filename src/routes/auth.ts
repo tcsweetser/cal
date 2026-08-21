@@ -8,6 +8,7 @@ import {
   findAccountByUserAndEmail,
   findPrimaryAccountForUser,
   createAccount,
+  markAccountStatus,
 } from "../db/schema";
 import { storeTokens } from "../services/tokenManager";
 import { createSession, destroySession, getSession, requireAuth, SESSION_COOKIE } from "../middleware/auth";
@@ -174,13 +175,23 @@ async function handleConnectCallback(
     );
   }
 
+  // A `revoked`/`error` row means this exact account was linked before and
+  // needs fresh tokens (e.g. Google's refresh token expired — see
+  // DEPLOYMENT.md's Testing-status note) — reuse its id and reactivate it,
+  // rather than the pre-existing behavior of unconditionally rejecting any
+  // already-linked email. Only a still-`active` row blocks reconnecting,
+  // since that indicates a genuine duplicate-link attempt, not a recovery.
   const existing = await findAccountByUserAndEmail(c.env.DB, session.userId, email);
-  if (existing) {
+  if (existing && existing.status === "active") {
     return c.text(`${email} is already linked to this user.`, 409);
   }
 
-  const accountId = crypto.randomUUID();
-  await createAccount(c.env.DB, { id: accountId, userId: session.userId, email, role: "secondary", tag });
+  const accountId = existing?.id ?? crypto.randomUUID();
+  if (existing) {
+    await markAccountStatus(c.env.DB, accountId, "active");
+  } else {
+    await createAccount(c.env.DB, { id: accountId, userId: session.userId, email, role: "secondary", tag });
+  }
   await storeTokens(c.env, accountId, {
     access_token: tokens.access_token,
     refresh_token: tokens.refresh_token,
