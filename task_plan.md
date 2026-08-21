@@ -450,3 +450,44 @@ Motivation: Workers Builds (set up this session — see `DEPLOYMENT.md`'s "Conti
 - Branch protection specifics (required review count, whether Claude Code sessions get an exemption for direct pushes to `dev`, etc.) — left for the user to decide when this phase is actually implemented, not guessed here.
 
 Nothing in this phase has been implemented yet — no branch created, no GitHub settings changed, no Actions workflow file added. Purely a plan, written up per explicit request while other work was blocked on the user's own quota/availability.
+
+## Phase 9 (planned, not started): UI redesign — integrate `docs/mockups/CAL_UI_Mockups.html`
+
+User dropped a static interactive mockup (`docs/mockups/CAL_UI_Mockups.html`, 572 lines) covering all 9 screens of the app — built with a design-canvas demo scaffold (`x-dc`/`DCLogic`/`sc-if`/`sc-for` — a component-preview tool, not a real framework the app uses). It is a reference for visual design only; nothing in it is portable code — the actual work is re-implementing the same look in this app's real stack: server-rendered Hono JSX views (`src/views/*.tsx`), each with its own inline `<style>` string (no CSS framework, no build step for CSS). Not started; this section is the plan only, per explicit request ("plan it and report back").
+
+**Important distinction the mockup blurs**: its top dark pill-bar ("CAL — UI Mockups" + Login/Accounts/Roles/... buttons) is the *demo tool's own screen switcher*, not part of the real app chrome — it must not be ported. The real app chrome shown per-screen is: light page background, a 230px left sidebar (avatar tile, user email, nav items with an active-dot indicator, log-out at the bottom) for the six authenticated dashboard screens, and a centered card with no sidebar for the three public/unauthenticated screens (login, booking, poll-voting) — consistent with how `views/login.tsx`, `views/booking.tsx`, and `views/pollVoting.tsx` already deliberately opt out of the dashboard `Layout` today (see their own comments on why).
+
+**Screen → file mapping** (mockup screen id → real view, confirmed by reading both sides):
+| Mockup screen | Real file(s) |
+|---|---|
+| Login | `views/login.tsx` (standalone, no `Layout`) |
+| Accounts | `views/dashboard.tsx` (via `Layout`) |
+| Roles & Tags | `views/mappings.tsx` (via `Layout`) |
+| Sync Logs | `views/logs.tsx` (via `Layout`) |
+| Invites | `views/invites.tsx` (via `Layout`) |
+| Meeting Polls (list) | `views/meetingPolls.tsx` → `MeetingPollsPage` (via `Layout`) |
+| Meeting Polls (detail/tally) | `views/meetingPolls.tsx` → `MeetingPollDetailPage` (via `Layout`) — mockup toggles list/detail with client state; the real app already has these as two separate routed pages, which maps even more cleanly |
+| Settings | `views/settings.tsx` (via `Layout`) |
+| Booking (public) | `views/booking.tsx` — `EmailVerifyForm`, `CodeEntryForm`, `SlotPickerForm`, `BookingConfirmedPage` (mockup only fully designs the slot-picker + confirmed states behind a 4-dot progress indicator; verify-email/enter-code have no mockup screen of their own — will need a consistent card style extrapolated from the same tokens) |
+| Poll Voting (public) | `views/pollVoting.tsx` — `PollEmailVerifyForm`, `PollCodeEntryForm`, `PollVotingForm`, `PollFinalizedPage` (same gap: mockup only shows the vote-table screen in detail) |
+
+**Design tokens to port** (mockup's inline `oklch(...)` values, currently duplicated ad hoc per element in the mockup — should become CSS custom properties defined once in `Layout`'s shared `<style>`, then reused by every view's own inline `<style>` block, matching the existing pattern where each view already keeps a local `css` string): page bg `oklch(97.3% 0.004 75)`, card/surface white, border `oklch(89% 0.005 75)`, text `oklch(22% 0.01 75)`, muted text `oklch(45–52% 0.01 75)`, accent blue `oklch(53% 0.16 262)` (buttons, links, active nav state, focus), sidebar-active tint `oklch(94% 0.03 262)`. Badge tiers (mockup's `badge()`/`STATUS_TIER`): success = green, danger = red, warning = amber, generalized as reusable `.badge-success/-danger/-warning` classes.
+
+**Real status enums vs. mockup's placeholder ones** — the mockup invents illustrative status strings (`booked`, `active`, etc.) that don't all match this app's actual enums (checked against `db/schema.ts` this session). Actual mapping needed, by tier:
+- success (green): `active`, `success`, `finalized`, `used`
+- danger (red): `revoked`, `error`, `expired`, `cancelled`
+- warning (amber): `in_progress`, `open`, `pending`, `verified`
+(`AccountStatus`, `SyncLogStatus`, `TrustedInviteStatus`, `MeetingPollStatus` — four different enums, one shared tier mapping.) Current `layout.tsx` CSS already has `.badge-active/-success/-finalized`, `.badge-revoked/-error/-cancelled`, `.badge-in_progress/-open` — missing explicit rules for `used`, `expired` (has `expired`? — no, currently absent, falls through unstyled), `pending`, `verified`. These need adding; each view already emits `badge-${status}` directly from the real enum value (see `dashboard.tsx`, `invites.tsx`, `logs.tsx`, `mappings.tsx`, `meetingPolls.tsx`), so no view-level code changes are needed for this part, only the shared CSS.
+
+**Open decisions — need your call before implementing, not guessed:**
+1. **Sidebar identity tile** — RESOLVED (2026-08-21, user asked for real Google photo instead of the generic-logo default originally recommended here): use the real Google name + profile photo, not a generic logo, not the mockup's fake "TS" initials. Checked feasibility against the real OAuth code first: `routes/auth.ts` already calls Google's `userinfo` endpoint on login (line ~237) but only reads `.email` and discards the rest; the requested scope (`SCOPES`, line 30) is `openid email https://www.googleapis.com/auth/calendar` — no `profile` scope, so `name`/`picture` aren't returned today. Plan:
+   - Add `profile` to `SCOPES` → `userinfo` then returns `name` and `picture` (a direct `lh3.googleusercontent.com` URL, drop straight into `<img src>`, no proxying).
+   - New additive migration: `users` table (not `accounts` — `users` is one row per signed-in person; `accounts` is one row per *connected calendar*, including secondaries, so identity display must follow the user, not whichever account is selected) gets `name TEXT`, `picture_url TEXT`, both nullable.
+   - Capture both in the existing callback handler that already calls `userinfo`, upserted on every login (not just first) so a changed Google photo/name stays current.
+   - `Layout` renders `<img src={picture_url}>` when present, falls back to an initials tile (same treatment `login.tsx` already uses) when a user has no Google photo set.
+   - One-time cost: scope change means a Google re-consent screen on next login — trivial for this single-user deployment.
+   - This still requires threading `UserRow` (now carrying name/picture) into `Layout` at all 6 dashboard call sites, same plumbing cost as the personalized-email option originally scoped here — just resolved in favor of doing it, with real data.
+2. **Dark mode**: the current app supports it for free via CSS `light-dark()` + `color-scheme: light dark` (see existing `layout.tsx`/`booking.tsx`/`pollVoting.tsx` CSS). The mockup is light-only (raw `oklch()` values, no dark variants). Porting it as-is silently drops dark mode. **Recommend wrapping every new token in `light-dark(<mockup-light-value>, <chosen-dark-value>)`** to preserve the existing capability — needs one dark value picked per token (straightforward: darken backgrounds, keep the same accent hue at adjusted lightness), not a blocker, just flagging that it's new work the mockup itself doesn't do.
+3. **Active nav state**: mockup derives it from in-memory `state.screen`. Server-rendered pages have no equivalent single source of truth today. Plan: give `Layout` a new required `active` prop (one of the 6 sidebar route ids), set explicitly by each page component — mechanical, ~7 one-line additions.
+
+**Proposed implementation order** (once approved): (1) `views/layout.tsx` — sidebar shell + shared CSS custom properties + badge tier fixes; (2) the 6 authenticated views, one at a time, swapping their current `<table>`/`<form>` markup for the mockup's card/section styling while keeping every existing form `action`/`method`/field `name` byte-for-byte identical (this is a pure visual pass — no route/handler/schema changes anywhere in this phase); (3) `views/login.tsx` centered card; (4) `views/booking.tsx` + `views/pollVoting.tsx` public flows, including the two extrapolated (non-mockup'd) verify/code screens. Verification per step: `tsc --noEmit`, existing `npm test` suite (should be unaffected — no logic changes, but confirms nothing broke), then a manual click-through of all 9 screens via `wrangler dev` (this app has no component/visual test coverage, so this is the only real check for a pure-CSS pass).
