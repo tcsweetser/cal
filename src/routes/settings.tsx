@@ -1,8 +1,15 @@
 import { Hono } from "hono";
 import type { AppBindings } from "../types";
 import { requireAuth } from "../middleware/auth";
-import { listAccountsForUser, getOrCreateSchedulingSettings, updateSchedulingSettings, findAccountForUser } from "../db/schema";
+import {
+  listAccountsForUser,
+  getOrCreateSchedulingSettings,
+  updateSchedulingSettings,
+  findAccountForUser,
+  findUserById,
+} from "../db/schema";
 import { SettingsPage } from "../views/settings";
+import { toSidebarUser } from "./sidebarUser";
 
 const settings = new Hono<AppBindings>();
 settings.use("/dashboard/settings", requireAuth);
@@ -18,18 +25,27 @@ function timeStringToMinutes(raw: unknown): number | null {
 
 settings.get("/dashboard/settings", async (c) => {
   const session = c.get("session");
-  const [current, accounts] = await Promise.all([
+  const [user, current, accounts] = await Promise.all([
+    findUserById(c.env.DB, session.userId),
     getOrCreateSchedulingSettings(c.env.DB, session.userId),
     listAccountsForUser(c.env.DB, session.userId),
   ]);
-  return c.html(<SettingsPage settings={current} accounts={accounts} saved={c.req.query("saved") === "1"} />);
+  return c.html(
+    <SettingsPage
+      user={toSidebarUser(user!)}
+      settings={current}
+      accounts={accounts}
+      saved={c.req.query("saved") === "1"}
+    />,
+  );
 });
 
 settings.post("/dashboard/settings", async (c) => {
   const session = c.get("session");
   const body = await c.req.parseBody();
 
-  const [current, accounts] = await Promise.all([
+  const [user, current, accounts] = await Promise.all([
+    findUserById(c.env.DB, session.userId),
     getOrCreateSchedulingSettings(c.env.DB, session.userId),
     listAccountsForUser(c.env.DB, session.userId),
   ]);
@@ -64,7 +80,7 @@ settings.post("/dashboard/settings", async (c) => {
 
   if (errors.length > 0 || workdayStartMinutes === null || workdayEndMinutes === null) {
     return c.html(
-      <SettingsPage settings={current} accounts={accounts} error={errors.join(" ")} />,
+      <SettingsPage user={toSidebarUser(user!)} settings={current} accounts={accounts} error={errors.join(" ")} />,
       errors.length > 0 ? 400 : 200,
     );
   }

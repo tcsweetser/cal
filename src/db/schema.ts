@@ -8,6 +8,8 @@ export type AccountStatus = "active" | "revoked" | "error";
 export interface UserRow {
   id: string;
   email: string;
+  name: string | null;
+  picture_url: string | null;
   created_at: string;
 }
 
@@ -25,8 +27,25 @@ export function findUserByEmail(db: D1Database, email: string): Promise<UserRow 
   return db.prepare("SELECT * FROM users WHERE email = ?").bind(email).first<UserRow>();
 }
 
+export function findUserById(db: D1Database, id: string): Promise<UserRow | null> {
+  return db.prepare("SELECT * FROM users WHERE id = ?").bind(id).first<UserRow>();
+}
+
 export async function createUser(db: D1Database, id: string, email: string): Promise<void> {
   await db.prepare("INSERT INTO users (id, email) VALUES (?, ?)").bind(id, email).run();
+}
+
+// Re-run on every login (not just first), so a changed Google display
+// name/photo is picked up here too — see migrations/0008_user_profile.sql.
+export async function updateUserProfile(
+  db: D1Database,
+  id: string,
+  profile: { name: string | null; picture_url: string | null },
+): Promise<void> {
+  await db
+    .prepare("UPDATE users SET name = ?, picture_url = ? WHERE id = ?")
+    .bind(profile.name, profile.picture_url, id)
+    .run();
 }
 
 export function findAccountByUserAndEmail(

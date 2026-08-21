@@ -5,6 +5,7 @@ import type { AccountTag } from "../db/schema";
 import {
   findUserByEmail,
   createUser,
+  updateUserProfile,
   findAccountByUserAndEmail,
   findPrimaryAccountForUser,
   createAccount,
@@ -28,7 +29,9 @@ const SESSION_TTL_SECONDS = 60 * 60 * 24 * 7; // 7 days
 const GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth";
 const GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token";
 const GOOGLE_USERINFO_URL = "https://www.googleapis.com/oauth2/v3/userinfo";
-const SCOPES = "openid email https://www.googleapis.com/auth/calendar";
+// `profile` (in addition to the openid/email/calendar scopes already needed)
+// buys the sidebar's real name + Google photo — see migrations/0008_user_profile.sql.
+const SCOPES = "openid email profile https://www.googleapis.com/auth/calendar";
 const VALID_TAGS: readonly AccountTag[] = ["business", "side_hustle", "personal"];
 
 interface OAuthFlowData {
@@ -116,6 +119,7 @@ auth.post("/auth/logout", async (c) => {
 async function handleLoginCallback(
   c: Context<AppBindings>,
   email: string,
+  profile: { name: string | null; picture_url: string | null },
   tokens: { access_token: string; refresh_token?: string; expires_at: number },
 ) {
   if (email !== c.env.PRIMARY_ACCOUNT_EMAIL.toLowerCase()) {
@@ -129,8 +133,9 @@ async function handleLoginCallback(
   if (!user) {
     const userId = crypto.randomUUID();
     await createUser(c.env.DB, userId, email);
-    user = { id: userId, email, created_at: new Date().toISOString() };
+    user = { id: userId, email, name: null, picture_url: null, created_at: new Date().toISOString() };
   }
+  await updateUserProfile(c.env.DB, user.id, profile);
 
   let primaryAccount = await findPrimaryAccountForUser(c.env.DB, user.id);
   if (!primaryAccount) {
@@ -248,14 +253,15 @@ auth.get("/auth/callback", async (c) => {
   const userinfoRes = await fetch(GOOGLE_USERINFO_URL, {
     headers: { Authorization: `Bearer ${tokens.access_token}` },
   });
-  const userinfo = await userinfoRes.json<{ email?: string }>();
+  const userinfo = await userinfoRes.json<{ email?: string; name?: string; picture?: string }>();
   const email = userinfo.email?.toLowerCase();
   if (!userinfoRes.ok || !email) {
     return c.text("Failed to fetch account email from Google", 502);
   }
+  const profile = { name: userinfo.name ?? null, picture_url: userinfo.picture ?? null };
 
   if (flow.purpose === "login") {
-    return handleLoginCallback(c, email, tokens);
+    return handleLoginCallback(c, email, profile, tokens);
   }
   if (!flow.tag) {
     return c.text("Missing tag for connect-account flow", 400);

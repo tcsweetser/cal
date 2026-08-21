@@ -2,7 +2,7 @@ import type { FC } from "hono/jsx";
 import { raw } from "hono/html";
 import type { AccountRow, MeetingPollRow } from "../db/schema";
 import type { PollTally } from "../services/trustedAccess";
-import { Layout } from "./layout";
+import { Layout, type SidebarUser } from "./layout";
 
 const statusBadge = (status: MeetingPollRow["status"]) => <span class={`badge badge-${status}`}>{status}</span>;
 
@@ -36,20 +36,21 @@ const LocalTimeScript = () => (
 const CANDIDATE_SLOT_ROWS = 6;
 
 export const MeetingPollsPage: FC<{
+  user: SidebarUser;
   accounts: AccountRow[];
   polls: MeetingPollRow[];
   allowedDurations: number[];
   remoteAvailable: boolean;
   sent?: number;
   failed?: number;
-}> = ({ accounts, polls, allowedDurations, remoteAvailable, sent, failed }) => {
+}> = ({ user, accounts, polls, allowedDurations, remoteAvailable, sent, failed }) => {
   const activeAccounts = accounts.filter((a) => a.status === "active");
   const accountEmail = (accountId: string) => accounts.find((a) => a.id === accountId)?.email ?? accountId;
 
   return (
-    <Layout title="Meeting polls">
+    <Layout title="Meeting polls" active="polls" user={user}>
       <h1>Meeting polls</h1>
-      <p>
+      <p class="lede">
         Propose a few candidate times to a group and let them vote on which ones work. Once everyone agrees on a
         time, finalize the poll to book it — a generic placeholder event is added to the calendar you choose below.
       </p>
@@ -66,20 +67,18 @@ export const MeetingPollsPage: FC<{
         {activeAccounts.length === 0 ? (
           <p class="empty">Connect an active account on the Accounts page before creating a poll.</p>
         ) : (
-          <form method="post" action="/dashboard/meeting-polls">
-            <p>
-              <label for="title">What's this meeting about?</label>
-              <br />
+          <form class="card stack" method="post" action="/dashboard/meeting-polls">
+            <label for="title">
+              What's this meeting about?
               <input type="text" id="title" name="title" required />
-            </p>
-            <p>
-              <label for="emails">Participant emails (one per line, or comma-separated):</label>
-              <br />
-              <textarea id="emails" name="emails" rows={4} cols={50} required />
-            </p>
-            <p>
+            </label>
+            <label for="emails">
+              Participant emails (one per line, or comma-separated)
+              <textarea id="emails" name="emails" rows={2} required />
+            </label>
+            <div class="row">
               <label>
-                Calendar to book on:{" "}
+                Calendar to book on
                 <select name="accountId" required>
                   {activeAccounts.map((account) => (
                     <option value={account.id}>
@@ -88,10 +87,8 @@ export const MeetingPollsPage: FC<{
                   ))}
                 </select>
               </label>
-            </p>
-            <p>
               <label>
-                Duration:{" "}
+                Duration
                 <select name="durationMinutes" required>
                   {allowedDurations.map((minutes) => (
                     <option value={minutes} selected={minutes === allowedDurations[0]}>
@@ -100,26 +97,31 @@ export const MeetingPollsPage: FC<{
                   ))}
                 </select>
               </label>
-            </p>
-            <p>
-              <label>
-                <input type="radio" name="modality" value="in_person" checked />
-                In person
-              </label>{" "}
-              <label>
-                <input type="radio" name="modality" value="remote" disabled={!remoteAvailable} />
-                Remote{!remoteAvailable && " (configure a Meet account in Settings to enable)"}
-              </label>
-            </p>
-            <p>
-              <label>Candidate times (fill in at least 2, in your own local time):</label>
-              {Array.from({ length: CANDIDATE_SLOT_ROWS }).map(() => (
-                <span class="slot-row">
-                  <input type="datetime-local" class="slot-local" />
-                  <input type="hidden" name="slotStarts" class="slot-utc" />
-                </span>
-              ))}
-            </p>
+              <div class="stack" style="gap: 0.375rem;">
+                <span style="font-size: 0.8125rem; font-weight: 600; color: var(--text-muted);">Modality</span>
+                <div class="row" style="gap: 0.875rem;">
+                  <label class="inline">
+                    <input type="radio" name="modality" value="in_person" checked />
+                    In person
+                  </label>
+                  <label class="inline">
+                    <input type="radio" name="modality" value="remote" disabled={!remoteAvailable} />
+                    Remote{!remoteAvailable && " (configure a Meet account in Settings)"}
+                  </label>
+                </div>
+              </div>
+            </div>
+            <label>
+              Candidate times (fill in at least 2, in your own local time)
+              <div class="stack" style="gap: 0.5rem;">
+                {Array.from({ length: CANDIDATE_SLOT_ROWS }).map(() => (
+                  <span class="slot-row">
+                    <input type="datetime-local" class="slot-local" style="max-width: 16rem;" />
+                    <input type="hidden" name="slotStarts" class="slot-utc" />
+                  </span>
+                ))}
+              </div>
+            </label>
             <script>
               {raw(
                 "document.querySelectorAll('.slot-row').forEach(function(row) { " +
@@ -127,9 +129,11 @@ export const MeetingPollsPage: FC<{
                   "local.addEventListener('input', function() { hidden.value = local.value ? new Date(local.value).toISOString() : ''; }); });",
               )}
             </script>
-            <p>
-              <button type="submit">Create poll</button>
-            </p>
+            <div>
+              <button class="btn-primary" type="submit">
+                Create poll
+              </button>
+            </div>
           </form>
         )}
       </section>
@@ -139,40 +143,44 @@ export const MeetingPollsPage: FC<{
         {polls.length === 0 ? (
           <p class="empty">None created yet.</p>
         ) : (
-          <table>
-            <thead>
-              <tr>
-                <th>Title</th>
-                <th>Calendar</th>
-                <th>Status</th>
-                <th>Booked</th>
-                <th>Created</th>
-              </tr>
-            </thead>
-            <tbody>
-              {polls.map((poll) => (
+          <div class="card card-flush">
+            <table>
+              <thead>
                 <tr>
-                  <td>
-                    <a href={`/dashboard/meeting-polls/${poll.id}`}>{poll.title}</a>
-                  </td>
-                  <td>
-                    <code>{accountEmail(poll.account_id)}</code>
-                  </td>
-                  <td>{statusBadge(poll.status)}</td>
-                  <td>
-                    {poll.booked_start ? (
-                      <span class="local-time" data-start={poll.booked_start}>
-                        {poll.booked_start}
-                      </span>
-                    ) : (
-                      "—"
-                    )}
-                  </td>
-                  <td>{new Date(poll.created_at).toLocaleString()}</td>
+                  <th>Title</th>
+                  <th>Calendar</th>
+                  <th>Status</th>
+                  <th>Booked</th>
+                  <th>Created</th>
                 </tr>
-              ))}
-            </tbody>
-          </table>
+              </thead>
+              <tbody>
+                {polls.map((poll) => (
+                  <tr>
+                    <td>
+                      <a class="text-link" href={`/dashboard/meeting-polls/${poll.id}`}>
+                        {poll.title}
+                      </a>
+                    </td>
+                    <td>
+                      <code>{accountEmail(poll.account_id)}</code>
+                    </td>
+                    <td>{statusBadge(poll.status)}</td>
+                    <td>
+                      {poll.booked_start ? (
+                        <span class="local-time" data-start={poll.booked_start}>
+                          {poll.booked_start}
+                        </span>
+                      ) : (
+                        "—"
+                      )}
+                    </td>
+                    <td>{new Date(poll.created_at).toLocaleString()}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
         )}
       </section>
       <LocalTimeScript />
@@ -181,24 +189,27 @@ export const MeetingPollsPage: FC<{
 };
 
 export const MeetingPollDetailPage: FC<{
+  user: SidebarUser;
   poll: MeetingPollRow;
   tally: PollTally;
   accounts: AccountRow[];
   error?: string;
   sent?: number;
   failed?: number;
-}> = ({ poll, tally, accounts, error, sent, failed }) => {
+}> = ({ user, poll, tally, accounts, error, sent, failed }) => {
   const accountEmail = accounts.find((a) => a.id === poll.account_id)?.email ?? poll.account_id;
 
   return (
-    <Layout title={poll.title}>
-      <p>
-        <a href="/dashboard/meeting-polls">&larr; All polls</a>
+    <Layout title={poll.title} active="polls" user={user}>
+      <p style="margin: 0 0 1rem;">
+        <a class="text-link" href="/dashboard/meeting-polls">
+          &larr; All polls
+        </a>
       </p>
-      <h1>
+      <h1 style="display: flex; align-items: center; gap: 0.625rem; margin-bottom: 0.5rem;">
         {poll.title} {statusBadge(poll.status)}
       </h1>
-      <p>
+      <p class="lede" style="margin-bottom: 1.75rem;">
         <code>{accountEmail}</code> &middot; {poll.duration_minutes} minutes &middot;{" "}
         {poll.modality === "remote" ? "Remote" : "In person"}
       </p>
@@ -230,43 +241,46 @@ export const MeetingPollDetailPage: FC<{
         {tally.slots.length === 0 ? (
           <p class="empty">No candidate times.</p>
         ) : (
-          <table>
-            <thead>
-              <tr>
-                <th>Time</th>
-                <th>Available</th>
-              </tr>
-            </thead>
-            <tbody>
-              {tally.slots.map((s) => (
+          <div class="card card-flush" style="margin-bottom: 1.25rem;">
+            <table>
+              <thead>
                 <tr>
-                  <td>
-                    <span class="local-time" data-start={s.slot.start_time}>
-                      {s.slot.start_time}
-                    </span>
-                    {s.slot.id === poll.chosen_slot_id && " (chosen)"}
-                  </td>
-                  <td>
-                    {s.availableCount} / {tally.totalParticipants}
-                    {s.fullyAvailable && tally.totalParticipants > 0 && " ✓ everyone available"}
-                  </td>
+                  <th>Time</th>
+                  <th>Available</th>
                 </tr>
-              ))}
-            </tbody>
-          </table>
+              </thead>
+              <tbody>
+                {tally.slots.map((s) => (
+                  <tr>
+                    <td>
+                      <span class="local-time" data-start={s.slot.start_time}>
+                        {s.slot.start_time}
+                      </span>
+                      {s.slot.id === poll.chosen_slot_id && " (chosen)"}
+                    </td>
+                    <td>
+                      {s.availableCount} / {tally.totalParticipants}
+                      {s.fullyAvailable && tally.totalParticipants > 0 && " ✓ everyone available"}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+        {poll.status === "open" && (
+          <div class="row">
+            <form method="post" action={`/dashboard/meeting-polls/${poll.id}/finalize`}>
+              <button class="btn-primary" type="submit">
+                Finalize (books first fully-available time)
+              </button>
+            </form>
+            <form method="post" action={`/dashboard/meeting-polls/${poll.id}/cancel`}>
+              <button type="submit">Cancel poll</button>
+            </form>
+          </div>
         )}
       </section>
-
-      {poll.status === "open" && (
-        <section>
-          <form method="post" action={`/dashboard/meeting-polls/${poll.id}/finalize`} class="inline">
-            <button type="submit">Finalize (books the first fully-available time)</button>
-          </form>{" "}
-          <form method="post" action={`/dashboard/meeting-polls/${poll.id}/cancel`} class="inline">
-            <button type="submit">Cancel poll</button>
-          </form>
-        </section>
-      )}
       <LocalTimeScript />
     </Layout>
   );

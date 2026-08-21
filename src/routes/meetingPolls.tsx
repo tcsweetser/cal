@@ -6,6 +6,7 @@ import {
   getOrCreateSchedulingSettings,
   listMeetingPollsForUser,
   findMeetingPollForUser,
+  findUserById,
   type AppointmentModality,
 } from "../db/schema";
 import {
@@ -19,6 +20,7 @@ import {
   type FinalizePollResult,
 } from "../services/trustedAccess";
 import { MeetingPollsPage, MeetingPollDetailPage } from "../views/meetingPolls";
+import { toSidebarUser } from "./sidebarUser";
 
 const meetingPolls = new Hono<AppBindings>();
 meetingPolls.use("/dashboard/meeting-polls", requireAuth);
@@ -81,7 +83,8 @@ function lookupErrorMessage(code: string | undefined): string | undefined {
 
 meetingPolls.get("/dashboard/meeting-polls", async (c) => {
   const session = c.get("session");
-  const [accounts, polls, settings] = await Promise.all([
+  const [user, accounts, polls, settings] = await Promise.all([
+    findUserById(c.env.DB, session.userId),
     listAccountsForUser(c.env.DB, session.userId),
     listMeetingPollsForUser(c.env.DB, session.userId),
     getOrCreateSchedulingSettings(c.env.DB, session.userId),
@@ -90,6 +93,7 @@ meetingPolls.get("/dashboard/meeting-polls", async (c) => {
   const failedParam = c.req.query("failed");
   return c.html(
     <MeetingPollsPage
+      user={toSidebarUser(user!)}
       accounts={accounts}
       polls={polls}
       allowedDurations={allowedAppointmentDurations(settings)}
@@ -166,7 +170,8 @@ meetingPolls.get("/dashboard/meeting-polls/:id", async (c) => {
   const session = c.get("session");
   const poll = await findMeetingPollForUser(c.env.DB, session.userId, c.req.param("id"));
   if (!poll) return c.text("Poll not found.", 404);
-  const [tally, accounts] = await Promise.all([
+  const [user, tally, accounts] = await Promise.all([
+    findUserById(c.env.DB, session.userId),
     getPollTally(c.env, poll.id),
     listAccountsForUser(c.env.DB, session.userId),
   ]);
@@ -174,6 +179,7 @@ meetingPolls.get("/dashboard/meeting-polls/:id", async (c) => {
   const failedParam = c.req.query("failed");
   return c.html(
     <MeetingPollDetailPage
+      user={toSidebarUser(user!)}
       poll={poll}
       tally={tally}
       accounts={accounts}

@@ -1,9 +1,16 @@
 import { Hono } from "hono";
 import type { AppBindings } from "../types";
 import { requireAuth } from "../middleware/auth";
-import { listAccountsForUser, listInvitesForUser, getOrCreateSchedulingSettings, type AppointmentModality } from "../db/schema";
+import {
+  listAccountsForUser,
+  listInvitesForUser,
+  getOrCreateSchedulingSettings,
+  findUserById,
+  type AppointmentModality,
+} from "../db/schema";
 import { createInvite, sendInviteEmail, allowedAppointmentDurations } from "../services/trustedAccess";
 import { InvitesPage } from "../views/invites";
+import { toSidebarUser } from "./sidebarUser";
 
 const invites = new Hono<AppBindings>();
 invites.use("/dashboard/invites", requireAuth);
@@ -29,7 +36,8 @@ function parseModality(raw: unknown): AppointmentModality | null {
 
 invites.get("/dashboard/invites", async (c) => {
   const session = c.get("session");
-  const [accounts, existingInvites, settings] = await Promise.all([
+  const [user, accounts, existingInvites, settings] = await Promise.all([
+    findUserById(c.env.DB, session.userId),
     listAccountsForUser(c.env.DB, session.userId),
     listInvitesForUser(c.env.DB, session.userId),
     getOrCreateSchedulingSettings(c.env.DB, session.userId),
@@ -38,6 +46,7 @@ invites.get("/dashboard/invites", async (c) => {
   const failedParam = c.req.query("failed");
   return c.html(
     <InvitesPage
+      user={toSidebarUser(user!)}
       accounts={accounts}
       invites={existingInvites}
       allowedDurations={allowedAppointmentDurations(settings)}

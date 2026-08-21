@@ -145,7 +145,9 @@ it("booking: the legitimate verifier's own cookie, obtained through the real HTT
   const getText = await getRes.text();
   expect(getText).toContain("Pick a time");
 
-  const slotMatch = getText.match(/<option value="([^"]+)">/);
+  // Slot picker renders as radio inputs (Phase 9 UI redesign), not <select><option> —
+  // same `name="start"` / value semantics, different markup.
+  const slotMatch = getText.match(/<input type="radio" name="start" value="([^"]+)"/);
   expect(slotMatch).not.toBeNull();
   const start = slotMatch![1]!;
 

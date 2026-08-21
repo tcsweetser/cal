@@ -1,64 +1,50 @@
-import type { FC, PropsWithChildren } from "hono/jsx";
+import type { FC } from "hono/jsx";
 import { raw } from "hono/html";
+import { PublicShell } from "./layout";
 
-const css = `
-  body {
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-    max-width: 420px;
-    margin: 4rem auto;
-    padding: 0 1.5rem;
-    line-height: 1.5;
-  }
-  h1 { font-size: 1.3rem; }
-  label { display: block; margin: 1rem 0 0.25rem; font-weight: 600; }
-  input[type="email"], input[type="text"], input[type="datetime-local"] {
-    width: 100%; padding: 0.5rem; font: inherit; box-sizing: border-box;
-    border: 1px solid light-dark(#ccc, #444); border-radius: 6px; background: light-dark(#fff, #1a1a1a); color: inherit;
-  }
-  button {
-    margin-top: 1.25rem; font: inherit; padding: 0.6rem 1.2rem; border-radius: 6px;
-    border: 1px solid light-dark(#ccc, #444); background: light-dark(#f5f5f5, #222); color: inherit; cursor: pointer;
-  }
-  button:hover { background: light-dark(#eaeaea, #2c2c2c); }
-  .error { color: light-dark(#c0392b, #ff6b5f); }
-  .hint { opacity: 0.7; font-size: 0.9em; }
-`;
-
-// Deliberately not the dashboard's Layout (no nav, no assumption of an
-// authenticated session) — same reasoning as views/login.tsx: this is public,
-// unauthenticated surface, HTML-only per the security model (task_plan.md
-// Phase 7 — no JSON mode, so there's nothing here for a scripted client to
-// discover or drive beyond submitting these exact forms).
-const PublicLayout: FC<PropsWithChildren<{ title: string }>> = ({ title, children }) => (
-  <html lang="en">
-    <head>
-      <meta charset="utf-8" />
-      <meta name="viewport" content="width=device-width, initial-scale=1" />
-      <title>{title} — CAL</title>
-      <style>{raw(css)}</style>
-    </head>
-    <body>{children}</body>
-  </html>
+// Mirrors the mockup's 4-dot step indicator (Verify email / Enter code /
+// Pick time / Confirmed) — purely cosmetic, doesn't affect which step is
+// actually being rendered (each step is still its own real page/route).
+const BOOKING_STEPS = ["Verify email", "Enter code", "Pick time", "Confirmed"] as const;
+const ProgressDots: FC<{ step: number }> = ({ step }) => (
+  <div style="display: flex; gap: 0.375rem; margin-bottom: 1.75rem;">
+    {BOOKING_STEPS.map((_, i) => (
+      <div
+        style={`flex: 1; height: 4px; border-radius: 999px; background: ${
+          i <= step ? "var(--accent)" : "var(--border)"
+        };`}
+      />
+    ))}
+  </div>
 );
 
 export const BookingErrorPage: FC<{ message: string }> = ({ message }) => (
-  <PublicLayout title="Booking link">
+  <PublicShell title="Booking link">
     <h1>This link isn't available</h1>
     <p>{message}</p>
-  </PublicLayout>
+  </PublicShell>
 );
 
 export const EmailVerifyForm: FC<{ inviteId: string; error?: string }> = ({ inviteId, error }) => (
-  <PublicLayout title="Verify your email">
+  <PublicShell title="Verify your email">
+    <ProgressDots step={0} />
     <h1>Verify your email</h1>
-    <p>Enter your email address and we'll send you a 6-digit code to confirm it's really you.</p>
+    <p class="lede" style="max-width: none;">
+      Enter your email address and we'll send you a 6-digit code to confirm it's really you.
+    </p>
     {error && <p class="error">{error}</p>}
-    <form method="post" action={`/book/${inviteId}/verify`}>
-      <label for="email">Email address</label>
-      <input type="email" id="email" name="email" required />
-      <button type="submit">Send code</button>
+    <form class="stack" method="post" action={`/book/${inviteId}/verify`}>
+      <label for="email">
+        Email address
+        <input type="email" id="email" name="email" required />
+      </label>
+      <div>
+        <button class="btn-primary" type="submit">
+          Send code
+        </button>
+      </div>
     </form>
-  </PublicLayout>
+  </PublicShell>
 );
 
 export const CodeEntryForm: FC<{ inviteId: string; email: string; error?: string }> = ({
@@ -66,25 +52,32 @@ export const CodeEntryForm: FC<{ inviteId: string; email: string; error?: string
   email,
   error,
 }) => (
-  <PublicLayout title="Enter your code">
+  <PublicShell title="Enter your code">
+    <ProgressDots step={1} />
     <h1>Enter your code</h1>
-    <p>
+    <p class="lede" style="max-width: none;">
       We sent a 6-digit code to <code>{email}</code>. It expires in 10 minutes.
     </p>
     {error && <p class="error">{error}</p>}
-    <form method="post" action={`/book/${inviteId}/confirm-email`}>
+    <form class="stack" method="post" action={`/book/${inviteId}/confirm-email`}>
       <input type="hidden" name="email" value={email} />
-      <label for="code">Code</label>
-      <input type="text" id="code" name="code" inputmode="numeric" pattern="[0-9]{6}" maxlength={6} required />
-      <button type="submit">Confirm</button>
+      <label for="code">
+        Code
+        <input type="text" id="code" name="code" inputmode="numeric" pattern="[0-9]{6}" maxlength={6} required />
+      </label>
+      <div>
+        <button class="btn-primary" type="submit">
+          Confirm
+        </button>
+      </div>
     </form>
-    <form method="post" action={`/book/${inviteId}/verify`}>
+    <form method="post" action={`/book/${inviteId}/verify`} style="margin-top: 0.75rem;">
       <input type="hidden" name="email" value={email} />
       <p class="hint">
-        Didn't get it? <button type="submit">Resend code</button> (once per minute)
+        Didn't get it? <button class="link" type="submit">Resend code</button> (once per minute)
       </p>
     </form>
-  </PublicLayout>
+  </PublicShell>
 );
 
 // Slot values are exact UTC instants (see computeAvailableSlots,
@@ -101,9 +94,10 @@ export const SlotPickerForm: FC<{ inviteId: string; slots: string[]; durationMin
   durationMinutes,
   error,
 }) => (
-  <PublicLayout title="Pick a time">
+  <PublicShell title="Pick a time" wide>
+    <ProgressDots step={2} />
     <h1>Pick a time</h1>
-    <p>
+    <p class="lede" style="max-width: none;">
       This will book a {durationMinutes}-minute appointment. It's shown as busy time only — no details are shared.
       Times below are shown in your own local time.
     </p>
@@ -112,34 +106,48 @@ export const SlotPickerForm: FC<{ inviteId: string; slots: string[]; durationMin
       <p>No times are available right now. Please check back later.</p>
     ) : (
       <form method="post" action={`/book/${inviteId}/confirm`}>
-        <label for="start">Start time</label>
-        <select id="start" name="start" required>
-          {slots.map((iso) => (
-            <option value={iso}>{iso}</option>
+        <style>
+          {raw(
+            ".slot-option { display: flex; align-items: center; gap: 0.625rem; padding: 0.7rem 0.875rem; " +
+              "border-radius: 8px; border: 1px solid var(--border); cursor: pointer; font-size: 0.85rem; } " +
+              ".slot-option:has(input:checked) { border-color: var(--accent); background: var(--accent-soft); }",
+          )}
+        </style>
+        <div class="stack" style="gap: 0.5rem; margin-bottom: 1.375rem;">
+          {slots.map((iso, i) => (
+            <label class="slot-option">
+              <input type="radio" name="start" value={iso} required checked={i === 0} />
+              <span class="local-time" data-start={iso}>
+                {iso}
+              </span>
+            </label>
           ))}
-        </select>
+        </div>
         <script>
           {raw(
-            "document.querySelectorAll('#start option').forEach(function(o) { " +
-              "o.textContent = new Date(o.value).toLocaleString(undefined, " +
+            "document.querySelectorAll('.local-time[data-start]').forEach(function(el) { " +
+              "el.textContent = new Date(el.dataset.start).toLocaleString(undefined, " +
               "{ weekday: 'short', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' }); });",
           )}
         </script>
-        <button type="submit">Book appointment</button>
+        <button class="btn-primary" type="submit">
+          Book appointment
+        </button>
       </form>
     )}
-  </PublicLayout>
+  </PublicShell>
 );
 
 export const BookingConfirmedPage: FC<{ startIso: string; durationMinutes: number }> = ({
   startIso,
   durationMinutes,
 }) => (
-  <PublicLayout title="Appointment booked">
+  <PublicShell title="Appointment booked">
+    <ProgressDots step={3} />
     <h1>You're booked</h1>
-    <p>
+    <p class="lede" style="max-width: none;">
       {durationMinutes} minutes starting{" "}
-      <strong id="confirmed-start" data-start={startIso}>
+      <strong id="confirmed-start" data-start={startIso} style="color: var(--text);">
         {startIso}
       </strong>{" "}
       (your local time). You can close this page.
@@ -150,5 +158,5 @@ export const BookingConfirmedPage: FC<{ startIso: string; durationMinutes: numbe
           "el.textContent = new Date(el.dataset.start).toLocaleString(); })();",
       )}
     </script>
-  </PublicLayout>
+  </PublicShell>
 );
