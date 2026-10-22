@@ -521,7 +521,7 @@ User-reported: live instance showing `revoked` status on connections. Root-cause
 
 **Proposed implementation order** (once approved): (1) `views/layout.tsx` — sidebar shell + shared CSS custom properties + badge tier fixes; (2) the 6 authenticated views, one at a time, swapping their current `<table>`/`<form>` markup for the mockup's card/section styling while keeping every existing form `action`/`method`/field `name` byte-for-byte identical (this is a pure visual pass — no route/handler/schema changes anywhere in this phase); (3) `views/login.tsx` centered card; (4) `views/booking.tsx` + `views/pollVoting.tsx` public flows, including the two extrapolated (non-mockup'd) verify/code screens. Verification per step: `tsc --noEmit`, existing `npm test` suite (should be unaffected — no logic changes, but confirms nothing broke), then a manual click-through of all 9 screens via `wrangler dev` (this app has no component/visual test coverage, so this is the only real check for a pure-CSS pass).
 
-## Phase 10 (2026-10-22, in progress): replace the `*/10` cron with a Durable Object alarm
+## Phase 10 (2026-10-22, shipped `cd1a1e2`): replace the `*/10` cron with a Durable Object alarm
 
 **Why**: the Cloudflare account is at its limit of 5 cron triggers. A Durable Object alarm gives the same 10-minute cadence without a cron slot. MailMCP's `Scheduler` class already uses this pattern on the same account.
 
@@ -551,3 +551,9 @@ User-reported: live instance showing `revoked` status on connections. Root-cause
 **Not done, deliberately**: a wall-clock deadline inside `runScheduledSync` / the queue drain (stop starting new work after ~12 min). With the retry skip, a killed run costs one skipped boundary, not a stall, and the queue is durable. Worth adding only if kills become routine.
 
 **Manual post-deploy check (can't be tested under vitest-pool-workers)**: if a tick is ever killed at the wall-time limit, confirm in observability that the retry logs "Skipping retried tick" and the next boundary's alarm still runs.
+
+**Shipped and verified (2026-10-22)**: pushed `cd1a1e2`; the Workers Build succeeded. Checks against production:
+- `GET .../workers/scripts/cf-cal-replication/schedules` returns `[]`.
+- Account-wide Cron Triggers: **3 of 5 used** (hitpacific-workers 1, newsletter-worker 2), so 2 slots are free. Before this change the count was 4, not 5 as the plan assumed.
+- One request to `/login` at 09:58:00Z started the alarm. The first alarm run wrote a `success` row to `sync_logs` at `10:00:00.356Z`. The cron's runs had always logged 8-14 s after the mark, so the sub-second timing confirms the alarm path ran.
+- Not yet checked: observability for `alarm` invocations and CPU time (the observability connector needed re-authentication), and the daily audit's KV key advancing on 2026-10-23 UTC.
