@@ -27,8 +27,18 @@
     }
   ],
 
-  // Runs the sync engine every 10 minutes (plan.md §5, incremental delta sync).
+  // Durable Object whose self-rearming alarm runs the sync engine every 10
+  // minutes (plan.md §5, incremental delta sync) — replaces the old Cron
+  // Trigger, see task_plan.md Phase 10 and src/services/syncScheduler.ts.
+  "durable_objects": {
+    "bindings": [{ "name": "SYNC_SCHEDULER", "class_name": "SyncScheduler" }]
+  },
+  // SQLite-backed classes are required on the Workers Free plan.
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["SyncScheduler"] }],
+
+  // Written out explicitly: omitting `triggers` leaves a previously deployed
+  // cron in place, and a lingering cron would run the sync alongside the alarm.
   "triggers": {
-    "crons": ["*/10 * * * *"]
+    "crons": []
   }
 }

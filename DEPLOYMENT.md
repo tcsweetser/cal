@@ -7,7 +7,7 @@ Follow the steps in order — each one is a prerequisite for the next; skipping 
 ## 0. Prerequisites
 
 - Node.js and npm installed.
-- A Cloudflare account (free tier is enough — D1, KV, and Cron Triggers are all available on it).
+- A Cloudflare account (free tier is enough — D1, KV, and SQLite-backed Durable Objects are all available on it).
 - A Google account you're willing to designate as the app's `PRIMARY_ACCOUNT_EMAIL` (the one that can log into the dashboard).
 - `git clone` this repo and `cd` into it.
 
@@ -152,7 +152,7 @@ npx wrangler deploy -c wrangler.local.jsonc
 
 **Checkpoint**: visit `https://<your-worker-domain>/auth/login`, log in as `PRIMARY_ACCOUNT_EMAIL`, and confirm you land on `/dashboard`. From there, use **"Connect a new account"** to link your secondary calendars, each picking a `tag` (business / side_hustle / personal).
 
-The Cron Trigger (10-minute sync) starts firing automatically once deployed — no separate step needed. Use `/dashboard/logs` and its **"Run sync now"** button to trigger a sync manually and confirm it completes without errors before waiting for the first scheduled tick.
+The 10-minute sync runs from a Durable Object alarm (`SyncScheduler`, see `src/services/syncScheduler.ts`), not a Cron Trigger. **The alarm starts on the first request the Worker serves after deploy**, so load any page (for example `/login`) once after the first deploy, or nothing will sync. Use `/dashboard/logs` and its **"Run sync now"** button to trigger a sync manually and confirm it completes without errors before waiting for the first scheduled tick.
 
 ## Continuous deployment (Workers Builds)
 
@@ -167,6 +167,7 @@ Once the manual deploy above works, you can connect this repo to [Workers Builds
 4. Configure the **non-production branch trigger** (all other branches, for preview deployments):
    - Build command: *(leave empty)*
    - Deploy command: `npm run ci:write-wrangler-config && npx wrangler versions upload -c wrangler.local.jsonc`
+   - `wrangler versions upload` refuses a version whose Durable Object migration hasn't been applied by a production `wrangler deploy` yet. A branch that adds a new migration (like `SyncScheduler`'s `v1`) fails its preview build until that migration has shipped from `master`.
 5. On **both** triggers, add two **secret** environment variables (Settings → Builds → Environment variables — mark both "Encrypt"):
    - `D1_DATABASE_ID` — the real value from your `wrangler.local.jsonc`'s `d1_databases[0].database_id`
    - `KV_NAMESPACE_ID` — the real value from your `wrangler.local.jsonc`'s `kv_namespaces[0].id`
@@ -181,7 +182,7 @@ Once the manual deploy above works, you can connect this repo to [Workers Builds
 | `redirect_uri_mismatch` at `/auth/callback` | The URI in Google Cloud Console credentials doesn't exactly match the Worker's actual origin (scheme/host/path). Re-check step 4 — production domain must match exactly, including `https://`. |
 | Login redirects back to `/auth/login` in a loop | `PRIMARY_ACCOUNT_EMAIL` doesn't match the Google account you're logging in with, or that account isn't listed as a test user on the OAuth consent screen (step 4.3) while the app is in "Testing" status. |
 | `npm test` fails on `atob()` of `undefined`/malformed input | `.dev.vars` doesn't exist or is missing `TOKEN_ENCRYPTION_KEY` — the test suite needs it to exist even though it never contacts real Google or Resend. Re-check step 2. |
-| `wrangler deploy` succeeds but sync never runs | Confirm the Cron Trigger is present in `wrangler.local.jsonc` (copied from `wrangler.jsonc`, not hand-edited out) and check `/dashboard/logs` for `error`-status runs rather than assuming silence means nothing ran. |
+| `wrangler deploy` succeeds but sync never runs | The alarm only starts on the first request after deploy: load any page once. Confirm `wrangler.local.jsonc` has the `SYNC_SCHEDULER` Durable Object binding and migration (copied from `wrangler.jsonc`), and check `/dashboard/logs` for `error`-status runs rather than assuming silence means nothing ran. Do **not** add a Cron Trigger back: it would run the sync alongside the alarm. |
 | A newly-connected secondary account's events never replicate | Confirm it was granted consent for the Calendar API scope (not just basic profile) — if it's a *test user* under a Testing-status OAuth app, re-check step 4.3 lists it. |
 | A previously-working account's status flips to `revoked` on its own, roughly a week after connecting (or after its last login/reconnect) | Google's Testing-status 7-day refresh-token cap, not a code bug — see step 4.3's note. Check `/dashboard/logs` for a sync-log message containing `invalid_grant`/`is no longer valid` naming the account to confirm. Fix: publish the OAuth consent screen (removes the cap going forward), then reconnect the affected account(s) via Accounts → Connect a secondary account to mint a fresh refresh token. |
 

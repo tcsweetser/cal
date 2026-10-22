@@ -7,7 +7,6 @@
   "scripts": {
     "prepare": "wrangler types",
     "dev": "wrangler dev",
-    "dev:scheduled": "wrangler dev --test-scheduled",
     "deploy": "wrangler deploy",
     "typecheck": "tsc --noEmit",
     "cf-typegen": "wrangler types",

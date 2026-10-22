@@ -520,3 +520,34 @@ User-reported: live instance showing `revoked` status on connections. Root-cause
 **Committed and pushed in isolation from Phase 9** (`60b5931`) — `routes/auth.ts` and `db/schema.ts` both also carry not-yet-committed Phase 9 profile-scope changes (the `profile` OAuth scope, `updateUserProfile`, `findUserById`) in the same files. To ship only the reconnect fix: reset both files to HEAD, re-applied just the reconnect-fix edits, verified `tsc`/tests with the Phase 9 diffs stashed aside (`git stash push` on the Phase-9-only files), committed+pushed, then restored the stash and re-applied the Phase 9 profile-scope edits on top of the new HEAD by hand (schema.ts wasn't included in the stash pathspec, so its Phase 9 additions had to be retyped from scratch — same content as originally written, re-verified with `tsc`/79 tests passing after restoration). Worth remembering next time multiple uncommitted efforts share a file: stash *every* touched file for the one being isolated, not just the ones that seemed obviously related.
 
 **Proposed implementation order** (once approved): (1) `views/layout.tsx` — sidebar shell + shared CSS custom properties + badge tier fixes; (2) the 6 authenticated views, one at a time, swapping their current `<table>`/`<form>` markup for the mockup's card/section styling while keeping every existing form `action`/`method`/field `name` byte-for-byte identical (this is a pure visual pass — no route/handler/schema changes anywhere in this phase); (3) `views/login.tsx` centered card; (4) `views/booking.tsx` + `views/pollVoting.tsx` public flows, including the two extrapolated (non-mockup'd) verify/code screens. Verification per step: `tsc --noEmit`, existing `npm test` suite (should be unaffected — no logic changes, but confirms nothing broke), then a manual click-through of all 9 screens via `wrangler dev` (this app has no component/visual test coverage, so this is the only real check for a pure-CSS pass).
+
+## Phase 10 (2026-10-22, in progress): replace the `*/10` cron with a Durable Object alarm
+
+**Why**: the Cloudflare account is at its limit of 5 cron triggers. A Durable Object alarm gives the same 10-minute cadence without a cron slot. MailMCP's `Scheduler` class already uses this pattern on the same account.
+
+**Design**
+- `SyncScheduler` (`src/services/syncScheduler.ts`), one instance named `"global"`. `alarm()` runs the same work as the old `scheduled()`: `runScheduledSync` then `maybeRunDailyAudit` (both moved into that file unchanged).
+- **The next alarm is set at the start of `alarm()`, before the sync runs**, not in `finally`. A cron run was once killed at the 15-minute wall-time limit (see the 2026-08 incident notes above). A killed handler never reaches `finally`, and unlike a cron, an alarm only recurs if the handler schedules it. Alarms on one object never overlap, so a run that outlasts the next boundary just delays the next tick.
+- The handler catches every error, so the platform's own retries (up to 6, exponential backoff) never fire on top of the next scheduled tick.
+- `ensure()` sets the alarm only if none is set. The Worker's `fetch` calls it once per isolate (module-scope `alarmChecked` flag), which starts the alarm after the first deploy and restarts it if it is ever lost.
+- `wrangler.jsonc`: DO binding `SYNC_SCHEDULER`, migration `v1` with `new_sqlite_classes` (the Free plan requires SQLite-backed classes), and `"triggers": { "crons": [] }` written out explicitly, because omitting `triggers` leaves the old cron in place on deploy.
+- The daily audit keeps its KV gate (`daily-recurring-audit:last-run-date`). Moving it into DO storage can be a separate change.
+
+**Limits (checked against Cloudflare docs 2026-10-22)**: DO alarm wall time is 15 min, the same as cron. Free-plan subrequests are 50 external / 1000 to Cloudflare services per invocation for both. `MAX_CALENDAR_API_CALLS_PER_RUN = 35` stays.
+
+**Cutover**: one deploy removes the cron and adds the DO, so the two paths never both run. After deploy, make one request to the site to start the alarm.
+
+**Verify after deploy**: the Worker's cron schedule list is empty; `sync_logs` gets new rows about every 10 minutes for an hour; observability shows `alarm` invocations with no uncaught errors; the KV audit key moves forward on the next UTC day.
+
+**Rollback**: revert the commit and deploy. The orphaned DO class can stay; removing it later needs a `deleted_classes` migration.
+
+**Independent review (code-reviewer agent, 2026-10-22)**: no blocking bugs; config and overlap reasoning confirmed. Changes made from it:
+- `alarm()` returns straight away on a platform retry (`alarmInfo.isRetry`), after re-arming. A retry means the previous attempt died, most likely at the wall-time limit; re-running the whole sync seconds later would just die again, and it is undocumented whether the alarm survives 6 failed retries.
+- 30s of slack when re-arming (`nextTenMinuteBoundary(now + 30s)`), so an alarm delivered a few ms early can't re-arm for its own boundary and run a second sync back to back.
+- `ensureSyncScheduler` made `async`, so a synchronous failure (missing binding) is logged and retried instead of escaping `fetch`.
+- Tests added for the retry skip and for the first-request path in `fetch` (`createExecutionContext`); re-arm assertions now check "future and on a boundary", not just "set".
+- Stale cron references fixed in DEPLOYMENT.md (bootstrap request is now documented; the troubleshooting row no longer tells you to re-add the cron), README.md, and code comments in `api.ts`, `syncEngine.ts`, `schema.ts`. DEPLOYMENT.md also notes that preview builds (`wrangler versions upload`) fail until migration `v1` has shipped from `master`.
+
+**Not done, deliberately**: a wall-clock deadline inside `runScheduledSync` / the queue drain (stop starting new work after ~12 min). With the retry skip, a killed run costs one skipped boundary, not a stall, and the queue is durable. Worth adding only if kills become routine.
+
+**Manual post-deploy check (can't be tested under vitest-pool-workers)**: if a tick is ever killed at the wall-time limit, confirm in observability that the retry logs "Skipping retried tick" and the next boundary's alarm still runs.

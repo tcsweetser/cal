@@ -8,8 +8,8 @@ const api = new Hono<AppBindings>();
 api.post("/api/trigger-sync", requireAuth, async (c) => {
   const session = c.get("session");
   // runFullSync's outer catch rethrows on structural failures (plan.md
-  // §5.3) — runScheduledSync (index.ts) already guards against that turning
-  // into an unhandled rejection inside waitUntil; this call site needs the
+  // §5.3) — runScheduledSync (services/syncScheduler.ts) already guards against that
+  // turning into an unhandled rejection; this call site needs the
   // same guard.
   c.executionCtx.waitUntil(
     runFullSync(c.env, session.userId).catch((err) => {

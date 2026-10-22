@@ -4,7 +4,7 @@ Open-source, edge-deployed system that keeps multiple Google Calendar accounts (
 
 ## Status
 
-✅ **Feature-complete and deployed in production.** Skeleton, DB schema, Google OAuth + encrypted token storage + sessions, the sync engine and cron handler, and the dashboard are all built, verified, and running live against 5 real Google accounts (1 primary + 4 secondary), replicating real events end to end — including creates, deletes/cancellations, and recurring events. See `task_plan.md` for the full build and incident history, including two production issues found and fixed after the initial deploy (a Workers subrequest-limit overrun on first full sync, and an unbounded incremental-sync gap for indefinitely-recurring events).
+✅ **Feature-complete and deployed in production.** Skeleton, DB schema, Google OAuth + encrypted token storage + sessions, the sync engine and its scheduler, and the dashboard are all built, verified, and running live against 5 real Google accounts (1 primary + 4 secondary), replicating real events end to end — including creates, deletes/cancellations, and recurring events. See `task_plan.md` for the full build and incident history, including two production issues found and fixed after the initial deploy (a Workers subrequest-limit overrun on first full sync, and an unbounded incremental-sync gap for indefinitely-recurring events).
 
 Full implementation plan and progress tracking: [`task_plan.md`](task_plan.md). For a full from-scratch deployment walkthrough (Google Cloud Console OAuth setup, Cloudflare provisioning, secrets, troubleshooting), see [`DEPLOYMENT.md`](DEPLOYMENT.md).
 
@@ -16,9 +16,9 @@ Full implementation plan and progress tracking: [`task_plan.md`](task_plan.md). 
   - Primary → every Secondary: replicated as `"Personal Time"`
   - Secondary → every other Secondary: replicated as `"Busy"`
 - Replicated events strip all identifying detail (no title, description, attendees, or location) — only free/busy status crosses calendars.
-- A background sync runs on a 10-minute Cron Trigger; deletions and edits (including flipping an event from busy to free) propagate automatically.
+- A background sync runs every 10 minutes from a Durable Object alarm (not a Cron Trigger, which the account has only 5 of); deletions and edits (including flipping an event from busy to free) propagate automatically.
 - **Sync window**: only events within a rolling window from now to 42 days out are replicated — not yet-ended (still-ongoing or upcoming) on the near side, starting within 42 days on the far side. This keeps each sync run within Cloudflare Workers' external-subrequest limit regardless of calendar size — see `task_plan.md` for the incidents that made this necessary (an indefinitely-recurring event with no end date expanded to hundreds of occurrences in one sync; then, symmetrically, a newly-created series anchored months in the past arrived with all its already-elapsed occurrences intact). Cancellations are never subject to this window in either direction — a stale replica is always cleaned up regardless of how far out (or how far in the past) it would have been.
-- **Daily recurring-series audit**: a recurring series that's never edited again would otherwise stop replicating new occurrences once they roll past the far edge of the sync window, since Google's incremental sync only reports *changes* and an untouched series never generates one. Once a day (piggybacked on whichever 10-minute cron tick is first after UTC midnight, gated by a KV timestamp rather than a second Cron Trigger — Cloudflare accounts have a small fixed budget of those), every recurring series the app has seen gets its `[covered_through, today+42d]` gap checked directly via Google's `events.instances()` endpoint and any new occurrence enqueued for the next normal sync to replicate. Only applies to series the app has seen *since this feature shipped* — a series fully synced before then is picked up once it's next touched (edited/cancelled) or a token-expiry forces a full re-sync.
+- **Daily recurring-series audit**: a recurring series that's never edited again would otherwise stop replicating new occurrences once they roll past the far edge of the sync window, since Google's incremental sync only reports *changes* and an untouched series never generates one. Once a day (piggybacked on whichever 10-minute tick is first after UTC midnight, gated by a KV timestamp rather than a schedule of its own), every recurring series the app has seen gets its `[covered_through, today+42d]` gap checked directly via Google's `events.instances()` endpoint and any new occurrence enqueued for the next normal sync to replicate. Only applies to series the app has seen *since this feature shipped* — a series fully synced before then is picked up once it's next touched (edited/cancelled) or a token-expiry forces a full re-sync.
 - Full design detail, including the data model and the loop-prevention mechanism, is in [`plan.md`](plan.md); the original build spec is in [`claude_code_prompt.md`](claude_code_prompt.md).
 
 ## Dashboard
@@ -42,7 +42,7 @@ Beyond calendar-to-calendar sync, the primary account can let a third party book
 
 ## Tech stack
 
-Cloudflare Workers · Hono (+ Hono JSX for the dashboard) · Cloudflare D1 · Cloudflare KV · Cron Triggers · Google Calendar API v3 · Google OAuth 2.0 (PKCE) · Vitest + `@cloudflare/vitest-pool-workers`
+Cloudflare Workers · Hono (+ Hono JSX for the dashboard) · Cloudflare D1 · Cloudflare KV · Durable Objects (alarms) · Google Calendar API v3 · Google OAuth 2.0 (PKCE) · Vitest + `@cloudflare/vitest-pool-workers`
 
 ## Setup
 

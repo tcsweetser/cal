@@ -352,7 +352,7 @@ async function reconcileAfterFullResync(
 // empty (never re-listing while a previous batch is still draining), and
 // every fetched event is durably queued before any replication is attempted
 // — so a budget cutoff mid-drain loses no work, and a large first-ever
-// backlog spreads itself across as many cron ticks as it needs rather than
+// backlog spreads itself across as many 10-minute ticks as it needs rather than
 // blowing the Workers subrequest cap in one invocation. Google's syncToken
 // only advances (via promotePendingSyncToken) once the queue a fetch
 // produced is fully drained — see task_plan.md for the incident this fixes.
@@ -502,8 +502,8 @@ export async function runFullSync(env: Env, userId: string): Promise<void> {
   }
 
   const logId = crypto.randomUUID();
-  // Atomic compare-and-insert: if a concurrent run (cron vs. a manual
-  // trigger) acquired the lock between our check above and now, this returns
+  // Atomic compare-and-insert: if a concurrent run (scheduled tick vs. a
+  // manual trigger) acquired the lock between our check above and now, this returns
   // false and we bail rather than both runs proceeding.
   const acquired = await tryStartSyncLog(env.DB, logId, userId);
   if (!acquired) return;
@@ -556,8 +556,8 @@ export async function runFullSync(env: Env, userId: string): Promise<void> {
 }
 
 // Separate, smaller budget from the main sync's MAX_CALENDAR_API_CALLS_PER_RUN
-// — this runs as an extra step inside the same scheduled() invocation (see
-// index.ts), sharing that invocation's real Workers subrequest ceiling, so it
+// — this runs as an extra step inside the same scheduled tick (see
+// services/syncScheduler.ts), sharing that invocation's real Workers subrequest ceiling, so it
 // must not compete for the main sync's own allowance. In steady state this
 // audit only spends 1 call per tracked series (each gap is normally a single
 // day wide), so this cap is generous headroom, not a tight constraint.
@@ -568,9 +568,8 @@ const MAX_DAILY_AUDIT_CALLS = 15;
 // one of its occurrences rolls into the sync window (FUTURE_WINDOW_MS) as
 // "now" advances (see task_plan.md, and the migration comment on
 // tracked_recurring_series). This
-// runs once a day (gated by a KV timestamp in index.ts, not a second cron
-// trigger — Cloudflare accounts have a small fixed cron-trigger budget, not
-// worth spending a second one on this). For each series whose covered_through
+// runs once a day (gated by a KV timestamp in services/syncScheduler.ts, piggybacked
+// on the 10-minute tick rather than given a schedule of its own). For each series whose covered_through
 // has fallen behind today's window edge, looks ahead just the newly-exposed
 // gap via events.instances() (unbounded by the syncToken restriction — see
 // fetchRecurringInstances) and enqueues anything not already queued, reusing

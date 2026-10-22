@@ -396,7 +396,7 @@ export interface SyncLogRow {
 }
 
 // Atomic compare-and-insert: returns false if another run's in_progress row
-// already exists (a manual trigger racing the cron, or vice versa), rather
+// already exists (a manual trigger racing a scheduled tick, or vice versa), rather
 // than the caller doing a separate SELECT-then-INSERT that both racers could
 // pass. Genuinely-stale lock recovery (see runFullSync) still needs its own
 // read first — that narrower window is accepted, see plan.md §5.3.
