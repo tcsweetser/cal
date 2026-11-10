@@ -436,11 +436,13 @@ async function syncAccount(
     // (including ones withinSyncWindow just filtered out), not just toQueue,
     // since an occurrence can be the very evidence that a series exists even
     // when that specific occurrence itself falls outside today's window.
+    // Distinct ids in one batch: one indefinite weekly series expands to about
+    // 730 instances, which is most of a run's 1,000 D1 calls if done singly.
+    const recurringSeriesIds = new Set<string>();
     for (const event of result.events) {
-      if (!isReplica(event) && event.recurringEventId) {
-        await trackRecurringSeriesIfNew(env.DB, userId, account.id, event.recurringEventId, timeMax);
-      }
+      if (!isReplica(event) && event.recurringEventId) recurringSeriesIds.add(event.recurringEventId);
     }
+    await trackRecurringSeriesIfNew(env.DB, userId, account.id, [...recurringSeriesIds], timeMax);
   }
 
   // Drain whatever's queued — what was just staged above, or left over from

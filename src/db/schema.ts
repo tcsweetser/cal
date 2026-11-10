@@ -355,17 +355,16 @@ export async function trackRecurringSeriesIfNew(
   db: D1Database,
   userId: string,
   accountId: string,
-  recurringEventId: string,
+  recurringEventIds: string[],
   coveredThrough: string,
 ): Promise<void> {
-  await db
-    .prepare(
-      `INSERT INTO tracked_recurring_series (user_id, account_id, recurring_event_id, covered_through)
-       VALUES (?, ?, ?, ?)
-       ON CONFLICT (account_id, recurring_event_id) DO NOTHING`,
-    )
-    .bind(userId, accountId, recurringEventId, coveredThrough)
-    .run();
+  if (recurringEventIds.length === 0) return;
+  const stmt = db.prepare(
+    `INSERT INTO tracked_recurring_series (user_id, account_id, recurring_event_id, covered_through)
+     VALUES (?, ?, ?, ?)
+     ON CONFLICT (account_id, recurring_event_id) DO NOTHING`,
+  );
+  await db.batch(recurringEventIds.map((id) => stmt.bind(userId, accountId, id, coveredThrough)));
 }
 
 export async function listRecurringSeriesNeedingAudit(
