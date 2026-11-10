@@ -206,12 +206,12 @@ async function syncAccount(
     try {
       result = storedToken
         ? await fetchEventsDelta(accessToken, { syncToken: storedToken })
-        : await fetchEventsDelta(accessToken, { timeMin, timeMax });
+        : await fetchEventsDelta(accessToken, { timeMin });
       budget.spend();
     } catch (err) {
       if (!(err instanceof SyncTokenExpiredError)) throw err;
       await clearSyncToken(env.DB, userId, account.id);
-      result = await fetchEventsDelta(accessToken, { timeMin, timeMax });
+      result = await fetchEventsDelta(accessToken, { timeMin });
       budget.spend();
       recovered = true;
     }

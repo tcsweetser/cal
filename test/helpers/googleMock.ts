@@ -51,6 +51,10 @@ export class GoogleCalendarMock {
   // listQueues but scoped per-series, since a real account can have more
   // than one tracked series being audited in the same test.
   private instancesQueues = new Map<string, GoogleCalendarEvent[]>();
+  // Query string of every LIST call (events.list), in order.
+  listRequests: URLSearchParams[] = [];
+  // Query string of every events.instances call, in order.
+  instancesRequests: URLSearchParams[] = [];
   inserts: MockInsert[] = [];
   patches: MockPatch[] = [];
   deletes: MockDelete[] = [];
@@ -131,6 +135,7 @@ export class GoogleCalendarMock {
       const accessToken = this.bearer(init);
 
       if (url.origin + url.pathname === EVENTS_URL && method === "GET") {
+        this.listRequests.push(new URLSearchParams(url.search));
         const queue = this.listQueues.get(accessToken) ?? [];
         const next = queue.shift();
         if (next === "410") return new Response("Gone", { status: 410 });
@@ -185,6 +190,7 @@ export class GoogleCalendarMock {
       // were itself an event id.
       const instancesMatch = url.pathname.match(/^\/calendar\/v3\/calendars\/primary\/events\/([^/]+)\/instances$/);
       if (instancesMatch && method === "GET") {
+        this.instancesRequests.push(new URLSearchParams(url.search));
         const recurringEventId = decodeURIComponent(instancesMatch[1]!);
         const events = this.instancesQueues.get(`${accessToken}:${recurringEventId}`) ?? [];
         return new Response(JSON.stringify({ items: events }), { status: 200 });

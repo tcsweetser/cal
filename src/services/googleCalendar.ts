@@ -108,7 +108,7 @@ interface EventsListResponse {
 
 export async function fetchEventsDelta(
   accessToken: string,
-  source: { syncToken: string } | { timeMin: string; timeMax?: string },
+  source: { syncToken: string } | { timeMin: string },
 ): Promise<EventsDeltaResult> {
   const events: GoogleCalendarEvent[] = [];
   let nextSyncToken: string | undefined;
@@ -116,12 +116,15 @@ export async function fetchEventsDelta(
   let pages = 0;
 
   do {
-    const params = new URLSearchParams({ singleEvents: "true", maxResults: "250" });
+    const params = new URLSearchParams({
+      singleEvents: "false",
+      showDeleted: "true",
+      maxResults: "250",
+    });
     if ("syncToken" in source) {
       params.set("syncToken", source.syncToken);
     } else {
       params.set("timeMin", source.timeMin);
-      if (source.timeMax) params.set("timeMax", source.timeMax);
     }
     if (pageToken) params.set("pageToken", pageToken);
 
@@ -197,6 +200,53 @@ export async function fetchRecurringInstances(
   } while (pageToken);
 
   return events;
+}
+
+const INSTANCE_LOOKUP_MARGIN_MS = 48 * 60 * 60 * 1000;
+
+// Finds the instance of a series that was originally scheduled at
+// `originalStart`, for exception replication when a derived replica instance id
+// 404s. The instances endpoint filters on an instance's *current* times, so an
+// instance moved earlier than its original start would be missed by a window
+// that starts there. The window therefore extends 48 hours either side; the
+// match itself is on originalStartTime. Timed starts compare as instants
+// (offsets differ between source and replica); all-day starts compare dates.
+// One call, no pagination: the window holds a handful of instances at most.
+export async function findInstanceByOriginalStart(
+  accessToken: string,
+  seriesId: string,
+  originalStart: GoogleEventDateTime,
+): Promise<GoogleCalendarEvent | null> {
+  let centreMs: number;
+  if (originalStart.date) {
+    centreMs = Date.parse(`${originalStart.date}T00:00:00Z`);
+  } else if (originalStart.dateTime) {
+    centreMs = Date.parse(originalStart.dateTime);
+  } else {
+    return null;
+  }
+  if (Number.isNaN(centreMs)) return null;
+
+  const params = new URLSearchParams({
+    timeMin: new Date(centreMs - INSTANCE_LOOKUP_MARGIN_MS).toISOString(),
+    timeMax: new Date(centreMs + INSTANCE_LOOKUP_MARGIN_MS).toISOString(),
+    maxResults: "250",
+  });
+  const res = await googleFetch(`${EVENTS_URL}/${encodeURIComponent(seriesId)}/instances?${params.toString()}`, {
+    headers: { Authorization: `Bearer ${accessToken}` },
+  });
+  if (res.status === 404 || res.status === 410) return null;
+  if (!res.ok) throw new GoogleApiError("instances lookup", res.status, await res.text());
+
+  const data = await res.json<EventsListResponse>();
+  return (
+    (data.items ?? []).find((item) => {
+      const o = item.originalStartTime;
+      if (!o) return false;
+      if (originalStart.date) return o.date === originalStart.date;
+      return o.dateTime !== undefined && Date.parse(o.dateTime) === centreMs;
+    }) ?? null
+  );
 }
 
 export async function insertEvent(
