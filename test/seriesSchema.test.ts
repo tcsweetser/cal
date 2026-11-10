@@ -131,6 +131,43 @@ it("markCutoverReset queues only this account's instance mappings, with their in
   expect(await getCutoverState(env.DB, other.id)).toBeNull();
 });
 
+it("markCutoverReset parses instance ids from the end, so a series id may contain \"_\"", async () => {
+  const { userId, source, target } = await setup();
+  const instances: Record<string, { series: string; date: string }> = {
+    "_outlookid_20261124T000000Z": { series: "_outlookid", date: "20261124" },
+    "abc_20261124T000000Z": { series: "abc", date: "20261124" },
+    "abc_20260901": { series: "abc", date: "20260901" },
+    "abc_R20260901T000000_20261124T000000Z": { series: "abc_R20260901T000000", date: "20261124" },
+  };
+  const byMapping = new Map<string, { series: string; date: string }>();
+  for (const [sourceEventId, expected] of Object.entries(instances)) {
+    byMapping.set(await seedMapping(userId, source.id, target.id, sourceEventId), expected);
+  }
+  // Not instances: an Outlook-origin single, a split series' own id, near
+  // misses on each suffix shape, and bare suffixes with no series before them.
+  for (const sourceEventId of [
+    "_outlookid",
+    "abc_R20260901T000000",
+    "abc_2026090A",
+    "abc_2026112XT000000Z",
+    "abc_20261124X000000Z",
+    "abc_20261124T00000AZ",
+    "abc_20261124T000000X",
+    "_20261124T000000Z",
+    "_20260901",
+  ]) {
+    await seedMapping(userId, source.id, target.id, sourceEventId);
+  }
+
+  await markCutoverReset(env.DB, userId, source.id);
+
+  const rows = await cleanupRows(source.id);
+  expect(rows).toHaveLength(byMapping.size);
+  for (const row of rows) {
+    expect({ series: row.source_series_id, date: row.instance_date }).toEqual(byMapping.get(row.mapping_id));
+  }
+});
+
 it("deleting an event mapping removes its legacy cleanup row", async () => {
   const { userId, source, target } = await setup();
   const mappingId = await seedMapping(userId, source.id, target.id, "ser1_20261124T000000Z");
@@ -185,3 +222,4 @@ it("per-tick lookups read a bounded number of rows", async () => {
   expect(metered.calls).toHaveLength(4);
   for (const call of metered.calls) expect(call.rowsRead).toBeLessThan(5);
 });
+

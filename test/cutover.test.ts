@@ -225,6 +225,34 @@ it("legacy future instance replicas are deleted only after their series has a re
   expect(firstDelete).toBeGreaterThan(lastInsert);
 });
 
+it("legacy instances of a series whose id starts with \"_\" are deleted once its replica series exists", async () => {
+  const s = await seriesSetup();
+  // Outlook-origin ids start with "_".
+  const legacy = [
+    await seedLegacyReplica(s.userId, s.biz.id, s.primary.id, "_outlookser", dateIn(1)),
+    await seedLegacyReplica(s.userId, s.biz.id, s.side.id, "_outlookser", dateIn(1)),
+  ];
+  const singleId = crypto.randomUUID();
+  await createEventMapping(env.DB, {
+    id: singleId,
+    userId: s.userId,
+    sourceAccountId: s.biz.id,
+    sourceEventId: "_outlooksingle",
+    targetAccountId: s.primary.id,
+    targetEventId: "outlook-single-replica",
+  });
+  mock.queueList("tok-biz", { events: [weeklySeries("_outlookser")], nextSyncToken: "biz-token-outlook" });
+
+  await runFullSync(env, s.userId);
+
+  expect(mock.inserts.map((i) => i.accessToken).sort()).toEqual(["tok-primary", "tok-side"]);
+  expect(mock.deletes.map((d) => d.eventId).sort()).toEqual(legacy.map((l) => l.targetEventId).sort());
+  for (const { mappingId } of legacy) expect(await mappingExists(mappingId)).toBe(false);
+  // The single was never queued for cleanup.
+  expect(await mappingExists(singleId)).toBe(true);
+  expect(await cleanupCount(s.biz.id)).toBe(0);
+});
+
 it("legacy instance replicas of a series that ended before cutover are kept", async () => {
   const s = await seriesSetup();
   const ended = await seedLegacyReplica(s.userId, s.biz.id, s.primary.id, "ser-ended", dateIn(-30));

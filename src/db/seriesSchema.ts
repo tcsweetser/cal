@@ -161,9 +161,14 @@ export function getCutoverState(
     .first<{ reset_at: string | null; completed_at: string | null }>();
 }
 
-// Google event ids contain no "_"; only expanded instance ids do
-// (<seriesId>_<YYYYMMDD[THHMMSSZ]>). One batch, so a crash cannot leave the
-// sync position cleared without the cleanup rows queued.
+// Expanded instance ids end in `_YYYYMMDDTHHMMSSZ` (timed) or `_YYYYMMDD`
+// (all-day), so the suffix is parsed from the END of the id, as migration 0004
+// does. A series id can itself contain "_": Outlook-origin ids start with one,
+// and the later half of a split is `<id>_R<start>`. Rows matching neither
+// shape are single events and are not queued. Digit checks are short GLOBs on
+// fixed-length substrings: D1 rejects a long GLOB ("pattern too complex").
+// One batch, so a crash cannot leave the sync position cleared without the
+// cleanup rows queued.
 export async function markCutoverReset(db: D1Database, userId: string, accountId: string): Promise<void> {
   await db.batch([
     db
@@ -171,11 +176,29 @@ export async function markCutoverReset(db: D1Database, userId: string, accountId
         `INSERT OR IGNORE INTO legacy_instance_cleanup
          (mapping_id, source_account_id, source_series_id, target_account_id, target_event_id, instance_date)
          SELECT id, source_account_id,
-                substr(source_event_id, 1, instr(source_event_id, '_') - 1),
+                substr(source_event_id, 1, length(source_event_id) - suffix_len),
                 target_account_id, target_event_id,
-                substr(source_event_id, instr(source_event_id, '_') + 1, 8)
-         FROM event_mappings
-         WHERE source_account_id = ? AND instr(source_event_id, '_') > 0`,
+                substr(source_event_id, 1 - suffix_len, 8)
+         FROM (
+           SELECT id, source_account_id, source_event_id, target_account_id, target_event_id,
+                  CASE
+                    WHEN length(source_event_id) > 17
+                         AND substr(source_event_id, -17, 1) = '_'
+                         AND substr(source_event_id, -16, 8) NOT GLOB '*[^0-9]*'
+                         AND substr(source_event_id, -8, 1) = 'T'
+                         AND substr(source_event_id, -7, 6) NOT GLOB '*[^0-9]*'
+                         AND substr(source_event_id, -1, 1) = 'Z'
+                      THEN 17
+                    WHEN length(source_event_id) > 9
+                         AND substr(source_event_id, -9, 1) = '_'
+                         AND substr(source_event_id, -8, 8) NOT GLOB '*[^0-9]*'
+                      THEN 9
+                    ELSE 0
+                  END AS suffix_len
+           FROM event_mappings
+           WHERE source_account_id = ? AND instr(source_event_id, '_') > 0
+         )
+         WHERE suffix_len > 0`,
       )
       .bind(accountId),
     db.prepare("DELETE FROM sync_tokens WHERE user_id = ? AND account_id = ?").bind(userId, accountId),
