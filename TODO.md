@@ -29,3 +29,13 @@ Resource audit follow-ups (2026-11-10, none near a limit today; see `task_plan.m
 - [ ] Reuse one `Intl.DateTimeFormat` per time zone in the slot picker (may exceed the 10 ms CPU limit)
 - [ ] Email send caps are check-then-act, and invite/poll lists are uncapped
 - [ ] `CallBudget` doesn't count list pages, retries or token refreshes, so the 50-subrequest cap is reachable
+
+Queue failure handling follow-ups (2026-11-10 review; see `task_plan.md`):
+- [ ] Retry counter or per-target parking, so one persistently failing target can't hold every source queue
+- [ ] Deterministic client-supplied event ids, so a retried insert can't create a second replica (check Google's id rules and deleted-id behaviour first)
+- [ ] Moving an event outside the 42-day window leaves its replica at the old time (pre-existing)
+- [ ] A failed re-fetch after a 410 loses reconciliation; a 5xx on a reconciliation delete isn't retried (pre-existing)
+- [ ] Track recurring series before enqueueing, so a failed tracking batch can't lose the series (pre-existing)
+- [ ] Mass cancellations bypass `CallBudget` and can reach the D1 call cap (pre-existing)
+- [ ] Changes during a target's revoked window aren't replayed on reconnect (pre-existing)
+- [ ] Cloudflare docs disagree on D1 calls per invocation on Free (50 on the D1 page, 1,000 on the Workers page); the code assumes 1,000

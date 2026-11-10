@@ -119,7 +119,77 @@ it("a cancellation whose replica is on a revoked account doesn't block the queue
   expect(await findEventMappingsBySource(env.DB, biz.id, "ev-good")).toHaveLength(1);
 });
 
-it.each([500, 429, 401, 403])(
+async function mapReplica(userId: string, sourceId: string, targetId: string, sourceEventId: string): Promise<void> {
+  await createEventMapping(env.DB, {
+    id: crypto.randomUUID(),
+    userId,
+    sourceAccountId: sourceId,
+    sourceEventId,
+    targetAccountId: targetId,
+    targetEventId: "replica-1",
+  });
+}
+
+it("a Google 5xx on a patch keeps the update queued, and a later run applies it", async () => {
+  const { userId, primary, biz } = await createAccounts();
+  await mapReplica(userId, biz.id, primary.id, "ev-a");
+  mock.failPatches(500);
+  mock.queueList("tok-biz", { events: [opaqueEvent("ev-a", 1)], nextSyncToken: "biz-token-1" });
+
+  await runFullSync(env, userId);
+
+  expect(await queuedCount(biz.id)).toBe(1);
+  expect(await storedSyncToken(biz.id)).toBeNull();
+
+  mock.failPatches(null);
+  await runFullSync(env, userId);
+
+  expect(mock.patches.map((p) => p.eventId)).toEqual(["replica-1"]);
+  expect(await queuedCount(biz.id)).toBe(0);
+}, 10000);
+
+it("a 400 on a patch drops only that update", async () => {
+  const { userId, primary, biz } = await createAccounts();
+  await mapReplica(userId, biz.id, primary.id, "ev-a");
+  mock.failPatches(400);
+  mock.queueList("tok-biz", { events: [opaqueEvent("ev-a", 1)], nextSyncToken: "biz-token-1" });
+
+  await runFullSync(env, userId);
+
+  expect(await queuedCount(biz.id)).toBe(0);
+  expect(await storedSyncToken(biz.id)).toBe("biz-token-1");
+});
+
+it("a failed delete on a busy-to-free change keeps the event queued", async () => {
+  const { userId, primary, biz } = await createAccounts();
+  await mapReplica(userId, biz.id, primary.id, "ev-a");
+  mock.failDeletes(500);
+  mock.queueList("tok-biz", {
+    events: [{ ...opaqueEvent("ev-a", 1), transparency: "transparent" }],
+    nextSyncToken: "biz-token-1",
+  });
+
+  await runFullSync(env, userId);
+
+  expect(await queuedCount(biz.id)).toBe(1);
+  expect(await storedSyncToken(biz.id)).toBeNull();
+}, 10000);
+
+it("a 400 on a replica delete doesn't hold the queue", async () => {
+  const { userId, primary, biz } = await createAccounts();
+  await mapReplica(userId, biz.id, primary.id, "ev-x");
+  mock.failDeletes(400);
+  mock.queueList("tok-biz", { events: [{ id: "ev-x", status: "cancelled" }], nextSyncToken: "biz-token-1" });
+
+  await runFullSync(env, userId);
+
+  expect(await queuedCount(biz.id)).toBe(0);
+  expect(await storedSyncToken(biz.id)).toBe("biz-token-1");
+});
+
+// Everything except a 400 says nothing about the event's own content: 404 on
+// an insert would mean the target calendar is missing, for example.
+it.each([500, 429, 401, 403, 404, 408, 409, 412])(
   "a Google %i on an insert keeps the delta queued, and a later run replicates it",
   async (status) => {
     const { userId, biz } = await createAccounts();

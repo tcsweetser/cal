@@ -167,17 +167,14 @@ function errMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
 
-// 4xx statuses about the account, quota or request rather than this event.
-// Google uses 403 for rate limits as well as permissions.
-const NON_EVENT_4XX = new Set([401, 403, 408, 429]);
-
 // True only when the event itself can't be processed, so retrying can never
-// help and it's safe to drop from the queue. Anything else (an outage, an auth
-// or token failure, the Workers subrequest cap) says nothing about the event:
+// help and it's safe to drop from the queue: Google answering 400. Anything
+// else (an outage, an auth or token failure, a rate limit, a missing calendar,
+// the Workers subrequest cap) says nothing about the event:
 // dropping it would lose the work, because the syncToken still advances once
 // the queue is empty and Google won't send that change again.
 function isUnprocessableEvent(err: unknown): boolean {
-  return err instanceof GoogleApiError && err.status >= 400 && err.status < 500 && !NON_EVENT_4XX.has(err.status);
+  return err instanceof GoogleApiError && err.status === 400;
 }
 
 // plan.md §5.3 step 5's topology table, role-only (tag never affects this).
@@ -472,8 +469,9 @@ async function syncAccount(
   // once fully processed (or once its own per-event try/catch below decides
   // to give up on it) — never removed mid-processing, so a budget cutoff
   // partway through leaves it there to resume from cleanly next time
-  // (processCreateOrUpdate is idempotent per target, so a partially-done
-  // event costs at most a few redundant PATCHes on retry, never a duplicate).
+  // (a target that already has a mapping is only PATCHed again on retry). One
+  // gap: if an insert reaches Google but its mapping is never written, the
+  // retry inserts a second replica and the first stays unmapped.
   drain: while (!budget.exhausted) {
     const batch = await dequeuePendingEvents(env.DB, account.id, QUEUE_DRAIN_BATCH_SIZE);
     if (batch.length === 0) break;

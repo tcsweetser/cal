@@ -570,7 +570,9 @@ User-reported: live instance showing `revoked` status on connections. Root-cause
 
 **Deferred to TODO.md**: sync-token write churn, KV write failure discarding a refreshed token, slot-picker formatter CPU, email cap races, `CallBudget` undercounting pages/retries/refreshes.
 
-**Decision**: a queue item is dropped only when Google rejects that event (a 4xx other than 401/403/408/429). Any other failure keeps it queued and stops that account's drain until the next tick. Tradeoff: an event that always gets a 5xx blocks its account's queue until it clears, and shows as an error on each run's sync log. A retry counter would remove that but needs a schema change, so it wasn't added.
+**Decision**: a queue item is dropped only when Google answers 400 for it. Any other failure keeps it queued and stops that account's drain until the next tick.
+
+**Tradeoff**: a persistent non-400 failure (a 5xx, 401 or 403, or an active target with no stored tokens) blocks the queue of every source account that replicates to that target, including replication to healthy targets. Each run logs an error. Before this change the same failure silently dropped the events. Removing the block needs a retry counter or per-target parking, which needs a schema change.
 
 A failed replica delete on a revoked target doesn't hold the queue, because that target stays unreachable until it's reconnected: the error is logged and the mapping is left in place, as it was before this change.
 

@@ -38,6 +38,8 @@ export class GoogleCalendarMock {
   private poisonedOriginEventIds = new Map<string, number>();
   // When set, every DELETE fails with this status.
   private deleteFailureStatus: number | null = null;
+  // When set, every PATCH fails with this status.
+  private patchFailureStatus: number | null = null;
   // Unlike poisonedOriginEventIds (keyed off sync-engine metadata a booking/
   // poll insert never sets), this fails *every* insert regardless of body —
   // for tests simulating a Google failure on the one-off placeholder events
@@ -93,6 +95,10 @@ export class GoogleCalendarMock {
 
   failDeletes(status: number | null) {
     this.deleteFailureStatus = status;
+  }
+
+  failPatches(status: number | null) {
+    this.patchFailureStatus = status;
   }
 
   poisonAllInserts() {
@@ -186,6 +192,9 @@ export class GoogleCalendarMock {
 
       const patchMatch = url.pathname.match(/^\/calendar\/v3\/calendars\/primary\/events\/(.+)$/);
       if (patchMatch && method === "PATCH") {
+        if (this.patchFailureStatus !== null) {
+          return new Response("Failed patch", { status: this.patchFailureStatus });
+        }
         const eventId = decodeURIComponent(patchMatch[1]!);
         if (this.goneOnPatch.has(eventId)) {
           this.goneOnPatch.delete(eventId); // consumed once

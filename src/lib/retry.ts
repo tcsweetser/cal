@@ -1,6 +1,7 @@
 // A sender can ask for a Retry-After of minutes or hours. Waiting that long
 // inside a sync tick would hold the sync lock and run towards the 15-minute
-// wall-time limit, so a longer wait is left to the next tick instead.
+// wall-time limit, so the wait is cut to this. A call that still fails is
+// handled like any other failure.
 const MAX_RETRY_DELAY_MS = 5000;
 
 // Retry-After may also be an HTTP date, which is treated as absent.
