@@ -262,6 +262,46 @@ it("legacy cleanup takes future instances first and stays within the call budget
   expect(await cleanupCount(s.biz.id)).toBe(15);
 });
 
+it("every account's future legacy instances are cleaned up before any account's past ones", async () => {
+  const s = await seriesSetup();
+  // biz syncs before side (email order), and only biz has past rows.
+  await seedSeriesMapping(s.userId, s.biz.id, "ser-a", s.primary.id);
+  await seedSeriesMapping(s.userId, s.side.id, "ser-b", s.primary.id);
+  const bizPast: string[] = [];
+  const sideFuture: string[] = [];
+  for (let i = 1; i <= 3; i++) {
+    bizPast.push((await seedLegacyReplica(s.userId, s.biz.id, s.primary.id, "ser-a", dateIn(-i))).targetEventId);
+    sideFuture.push((await seedLegacyReplica(s.userId, s.side.id, s.primary.id, "ser-b", dateIn(i))).targetEventId);
+  }
+  await completeCutover(s);
+  await markCutoverReset(env.DB, s.userId, s.side.id);
+  await markCutoverComplete(env.DB, s.side.id);
+
+  const result = await cleanup(s, new CallBudget(35, 60));
+
+  expect(result.processed).toBe(6);
+  expect(mock.deletes.map((d) => d.eventId)).toEqual([...sideFuture, ...bizPast]);
+});
+
+it("a failure in the future pass stops the past pass too", async () => {
+  const s = await seriesSetup();
+  await seedSeriesMapping(s.userId, s.biz.id, "ser-c", s.primary.id);
+  await seedSeriesMapping(s.userId, s.side.id, "ser-d", s.primary.id);
+  await seedLegacyReplica(s.userId, s.biz.id, s.primary.id, "ser-c", dateIn(-1));
+  await seedLegacyReplica(s.userId, s.side.id, s.primary.id, "ser-d", dateIn(1));
+  await completeCutover(s);
+  await markCutoverReset(env.DB, s.userId, s.side.id);
+  await markCutoverComplete(env.DB, s.side.id);
+  mock.failDeletes(403);
+
+  const result = await cleanup(s, new CallBudget(35, 60));
+
+  expect(result.errors).toHaveLength(1);
+  expect(deleteAttempts()).toBe(1);
+  expect(await cleanupCount(s.biz.id)).toBe(1);
+  expect(await cleanupCount(s.side.id)).toBe(1);
+});
+
 it("single-event mappings are never touched by the cleanup", async () => {
   const s = await seriesSetup();
   const singleId = crypto.randomUUID();

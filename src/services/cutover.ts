@@ -95,9 +95,12 @@ async function cleanUpRow(
 
 /**
  * Deletes legacy per-instance replicas for accounts whose cutover is
- * complete, within what's left of the run's call budget and item cap. Each
- * row takes one item, and one call when it deletes; rows kept as history
- * make no call, so the item cap is what bounds their D1 work.
+ * complete, within what's left of the run's call budget and item cap. Every
+ * account's future instances go before any account's past ones: the future
+ * ones are the doubled busy blocks the owner accepted for a few hours, and
+ * one account's past backlog must not hold up another's. Each row takes one
+ * item, and one call when it deletes; rows kept as history make no call, so
+ * the item cap is what bounds their D1 work.
  */
 export async function runLegacyCleanup(
   env: Env,
@@ -107,16 +110,21 @@ export async function runLegacyCleanup(
   today: string,
 ): Promise<BatchResult> {
   const total: BatchResult = { processed: 0, errors: [] };
+  if (budget.exhausted || budget.itemsExhausted) return total;
+  const completed: AccountRow[] = [];
   for (const account of accounts) {
-    if (budget.exhausted || budget.itemsExhausted) break;
-    const state = await getCutoverState(env.DB, account.id);
-    if (!state?.completed_at) continue;
-    const limit = Math.min(budget.remaining, budget.itemsRemaining);
-    for (const row of await listLegacyCleanup(env.DB, account.id, today, limit)) {
-      // Checked before taking a row, as in the queue drain.
+    if ((await getCutoverState(env.DB, account.id))?.completed_at) completed.push(account);
+  }
+  for (const phase of ["future", "past"] as const) {
+    for (const account of completed) {
       if (budget.exhausted || budget.itemsExhausted) return total;
-      budget.takeItem();
-      if ((await cleanUpRow(env, tokens, budget, row, total, account.email)) === "stop") return total;
+      const limit = Math.min(budget.remaining, budget.itemsRemaining);
+      for (const row of await listLegacyCleanup(env.DB, account.id, today, phase, limit)) {
+        // Checked before taking a row, as in the queue drain.
+        if (budget.exhausted || budget.itemsExhausted) return total;
+        budget.takeItem();
+        if ((await cleanUpRow(env, tokens, budget, row, total, account.email)) === "stop") return total;
+      }
     }
   }
   return total;

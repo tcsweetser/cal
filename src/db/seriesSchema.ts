@@ -199,30 +199,27 @@ export async function markCutoverComplete(db: D1Database, accountId: string): Pr
     .run();
 }
 
-// Future instances first (soonest first), since those are the ones showing
-// up as clutter; then, if room remains, the most recent past ones.
+export type LegacyCleanupPhase = "future" | "past";
+
+// One phase at a time, so the caller can take every account's future
+// instances before any account's past ones. Future instances come soonest
+// first, since those show up as doubled busy blocks; past ones most recent
+// first.
 export async function listLegacyCleanup(
   db: D1Database,
   sourceAccountId: string,
   today: string,
+  phase: LegacyCleanupPhase,
   limit: number,
 ): Promise<LegacyCleanupRow[]> {
-  const { results: future } = await db
-    .prepare(
-      `SELECT * FROM legacy_instance_cleanup
-       WHERE source_account_id = ? AND instance_date >= ? ORDER BY instance_date ASC LIMIT ?`,
-    )
-    .bind(sourceAccountId, today, limit)
-    .all<LegacyCleanupRow>();
-  if (future.length >= limit) return future;
-  const { results: past } = await db
-    .prepare(
-      `SELECT * FROM legacy_instance_cleanup
-       WHERE source_account_id = ? AND instance_date < ? ORDER BY instance_date DESC LIMIT ?`,
-    )
-    .bind(sourceAccountId, today, limit - future.length)
-    .all<LegacyCleanupRow>();
-  return [...future, ...past];
+  const sql =
+    phase === "future"
+      ? `SELECT * FROM legacy_instance_cleanup
+         WHERE source_account_id = ? AND instance_date >= ? ORDER BY instance_date ASC LIMIT ?`
+      : `SELECT * FROM legacy_instance_cleanup
+         WHERE source_account_id = ? AND instance_date < ? ORDER BY instance_date DESC LIMIT ?`;
+  const { results } = await db.prepare(sql).bind(sourceAccountId, today, limit).all<LegacyCleanupRow>();
+  return results;
 }
 
 export async function deleteLegacyCleanupRow(db: D1Database, mappingId: string): Promise<void> {

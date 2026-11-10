@@ -142,16 +142,18 @@ it("deleting an event mapping removes its legacy cleanup row", async () => {
   expect(await cleanupRows(source.id)).toHaveLength(0);
 });
 
-it("listLegacyCleanup returns future instances first, then the most recent past ones", async () => {
+it("listLegacyCleanup returns future instances soonest first, and past ones most recent first", async () => {
   const { userId, source, target } = await setup();
   for (const date of ["20261201", "20261111", "20261020", "20260901"]) {
     await seedMapping(userId, source.id, target.id, `ser1_${date}`);
   }
   await markCutoverReset(env.DB, userId, source.id);
 
-  const rows = await listLegacyCleanup(env.DB, source.id, "20261110", 3);
+  const future = await listLegacyCleanup(env.DB, source.id, "20261110", "future", 3);
+  const past = await listLegacyCleanup(env.DB, source.id, "20261110", "past", 1);
 
-  expect(rows.map((r) => r.instance_date)).toEqual(["20261111", "20261201", "20261020"]);
+  expect(future.map((r) => r.instance_date)).toEqual(["20261111", "20261201"]);
+  expect(past.map((r) => r.instance_date)).toEqual(["20261020"]);
 });
 
 it("per-tick lookups read a bounded number of rows", async () => {
