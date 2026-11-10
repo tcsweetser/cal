@@ -179,21 +179,24 @@ Once the manual deploy above works, you can connect this repo to [Workers Builds
 
 Recurring meetings used to be copied as one replica per instance, inside a 42-day window. They are now copied as one replica series per source series, and one-off events beyond 42 days are replicated too. The first deploy converts existing data. The conversion runs on its own, per source account, from the sync ticks. You do nothing after the deploy except watch it.
 
-The deploy applies migration 0010 (new tables only) before the new code runs. The first request after deploy restarts the alarm, as in step 7.
+The deploy applies migration 0010 (new tables only) before the new code runs. The first request after deploy restarts the alarm (see "sync never runs" in the Troubleshooting table).
 
 **What happens, per account**
 
 1. Legacy drain. Items already in `sync_queue` are handled the old way, so no queued cancellation is lost.
 2. Reset. On the tick the queue empties, the account's sync positions are cleared and its old instance mappings are queued in `legacy_instance_cleanup`.
-3. Full fetch. On the next tick (if the queue was already empty, the reset and the full fetch happen in the same tick), one fetch returns every live series and every one-off event. Series replicas are created, about 50 Google calls in total. Single events that already have a replica are patched in place.
+3. Full fetch. On the next tick (if the queue was already empty, the reset and the full fetch happen in the same tick, unless the tick's call budget is already used up), one fetch returns every live series and every one-off event. Series replicas are created, about 50 Google calls in total. On top of that, this first drain re-PATCHes every future single event that already has a replica, one call per target, so the whole drain takes well over 50 calls and spreads across several ticks.
 4. `series_cutover.completed_at` is set once the queue is empty and a new sync position has been saved after the reset.
-5. Cleanup. Old future instance replicas for all accounts are deleted first, then the past ones. A legacy row is deleted only when its target already has a replica series for that meeting.
+5. Cleanup. Old future instance replicas for all accounts whose cutover is complete are deleted first, then the past ones. A legacy row is deleted only when its target already has a replica series for that meeting.
 
 **Timeline and cost**
 
-- Cleanup of about 418 future instances runs at up to 35 Google calls per tick. That takes about 2 hours. During that time upcoming recurring meetings show two busy blocks on target calendars. The owner accepted this on 2026-11-10. Deleting first would show them as free, which is worse.
-- Then about 369 past instances are deleted the same way, about 2 more hours. There is no free-time risk, because the dates are past.
-- A run stops at 60 queue items plus 35 Google calls in total, across all accounts. New-mode work is capped at 60 queue items per tick too.
+- A run stops at whichever of 35 Google calls or 60 queue items comes first. Both caps are shared across all accounts and the cleanup, and accounts are served in order.
+- Later accounts may therefore not fetch for an hour or two while earlier accounts drain their first full fetch. A meeting booked on one of those later accounts in that time is not blocked on the other calendars until its account fetches.
+- Each legacy delete comes back in the target account's next fetch as a cancelled stub, and each stub takes one of the 60 queue items. Cleanup therefore runs nearer 25-30 rows per tick than 35.
+- Cleanup of about 418 future instances takes about 2.5 to 3 hours at that rate. During that time upcoming recurring meetings show two busy blocks on target calendars. The owner accepted this on 2026-11-10. Deleting first would show them as free, which is worse.
+- Then about 369 past instances are deleted the same way, about 2 to 2.5 more hours. There is no free-time risk, because the dates are past.
+- Deploy in a quiet period, when few meetings are being booked.
 
 **Watching progress**
 
@@ -220,7 +223,14 @@ npx wrangler d1 execute <db-name> --remote -c wrangler.local.jsonc \
 npx wrangler d1 info <db-name> -c wrangler.local.jsonc
 ```
 
-**Done when** every account has `completed_at` set and `legacy_instance_cleanup` is 0. `/dashboard/logs` shows the same errors as `sync_logs`.
+After cutover, check `sync_logs` for messages containing `failed: 400`. Google rejected that item, so it was dropped from the queue: a series whose insert got a 400 has no replica series, and its meetings are not blocked on target calendars.
+
+```bash
+npx wrangler d1 execute <db-name> --remote -c wrangler.local.jsonc \
+  --command "SELECT created_at, message FROM sync_logs WHERE message LIKE '%failed: 400%' ORDER BY created_at DESC LIMIT 20"
+```
+
+**Done when** every account has `completed_at` set and `legacy_instance_cleanup` is 0. Legacy replicas kept as history (series that ended before cutover) stay on target calendars with no cleanup row. `/dashboard/logs` shows the same errors as `sync_logs`.
 
 If it goes wrong, see the rollback section below.
 
@@ -229,7 +239,7 @@ If it goes wrong, see the rollback section below.
 Reverting the series commits alone is not enough: the old code would expand recurring series again and create per-instance replicas next to the replica series. While a KV flag is set, scheduled ticks and **"Run sync now"** delete replica series instead of syncing. Do this in order:
 
 1. Signed in as the owner, `POST /api/admin/series-rollback` (for example `fetch("/api/admin/series-rollback", { method: "POST" })` from the browser console on the dashboard). It sets the flag and returns `{ "status": "rollback started" }`.
-2. Poll `GET /api/admin/series-rollback` until it reports `"remaining": 0`. Each tick removes up to 35 replica series. When none remain, it also clears the sync positions and cutover state, so the old code does a full refetch. If `remaining` stops falling, check the logs for `Series rollback: mapping ...` errors: a persistent non-400 failure on one mapping holds the batch. Confirm `remaining: 0` on a second poll before reverting.
+2. Poll `GET /api/admin/series-rollback` until it reports `"remaining": 0`. Each tick removes up to 35 replica series. When none remain, it also clears the sync positions, cutover state and sync queue, so the old code does a full refetch and never replicates a queued series as a one-off event. If `remaining` stops falling, check the logs for `Series rollback: mapping ...` errors: a persistent non-400 failure on one mapping holds the batch. Confirm `remaining: 0` on a second poll before reverting.
 3. Revert the series commits on `master` and push. The old code then refetches and rebuilds per-instance replicas.
 4. Delete the flag: `npx wrangler kv key delete "series-replication:rollback" --namespace-id <your-kv-namespace-id> -c wrangler.local.jsonc`.
 
