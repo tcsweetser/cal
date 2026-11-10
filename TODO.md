@@ -22,3 +22,10 @@ Should be create a test/prod branch structure?
 
 - [ ] Dev branch + PR gate, so nothing reaches `master` (and therefore production) without review. Plan written up, nothing implemented yet: see `task_plan.md`'s "Phase 8 (planned, not started): dev branch workflow + PR gate". Scoped to git branch protection + a `dev` branch + a basic Actions CI check for now — a proper staging Cloudflare Worker/D1/KV and PR automation (preview URLs, etc.) are explicitly deferred to a later pass.
 
+
+Resource audit follow-ups (2026-11-10, none near a limit today; see `task_plan.md`):
+- [ ] Sync-token churn: 5 rows written per account per tick even when nothing changed (82% of rows written)
+- [ ] A failed KV write in `refreshTokens` discards the freshly issued token
+- [ ] Reuse one `Intl.DateTimeFormat` per time zone in the slot picker (may exceed the 10 ms CPU limit)
+- [ ] Email send caps are check-then-act, and invite/poll lists are uncapped
+- [ ] `CallBudget` doesn't count list pages, retries or token refreshes, so the 50-subrequest cap is reachable

@@ -557,3 +557,19 @@ User-reported: live instance showing `revoked` status on connections. Root-cause
 - Account-wide Cron Triggers: **3 of 5 used** (hitpacific-workers 1, newsletter-worker 2), so 2 slots are free. Before this change the count was 4, not 5 as the plan assumed.
 - One request to `/login` at 09:58:00Z started the alarm. The first alarm run wrote a `success` row to `sync_logs` at `10:00:00.356Z`. The cron's runs had always logged 8-14 s after the mark, so the sub-second timing confirms the alarm path ran.
 - Not yet checked: observability for `alarm` invocations and CPU time (the observability connector needed re-authentication), and the daily audit's KV key advancing on 2026-10-23 UTC.
+
+## D1 incident follow-up bundle (2026-11-10)
+
+**Context**: the `sync_logs` lock scans took D1 to 75% of the account's daily rows_read limit. Fixed by migration 0009 (`974c5cf`). A resource audit then found the items below. One push, separate commits; each behaviour change gets a failing test first.
+
+- [x] Correct two false comments in migration 0009 (bound-parameter claim, "zero or one entry")
+- [x] Cap `Retry-After` (Google and Resend clients)
+- [x] Existence check instead of `COUNT(*)` where only "is the queue empty" matters
+- [x] One D1 batch for distinct recurring series, not one call per instance
+- [x] Stop the queue drain dropping events on failures that aren't about the event, including failed replica deletes
+
+**Deferred to TODO.md**: sync-token write churn, KV write failure discarding a refreshed token, slot-picker formatter CPU, email cap races, `CallBudget` undercounting pages/retries/refreshes.
+
+**Decision**: a queue item is dropped only when Google rejects that event (a 4xx other than 401/403/408/429). Any other failure keeps it queued and stops that account's drain until the next tick. Tradeoff: an event that always gets a 5xx blocks its account's queue until it clears, and shows as an error on each run's sync log. A retry counter would remove that but needs a schema change, so it wasn't added.
+
+**Residual**: the `COUNT(*)` for the "N queued" status note stays, so a backlog still costs N rows per account per tick (a third of before).
