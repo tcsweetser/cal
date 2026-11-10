@@ -81,17 +81,16 @@ export async function processSeries(ctx: ReplicationContext, event: GoogleCalend
   let processed = 0;
   const errors: string[] = [];
 
-  // The id used to be a single event: its single replicas must go before
-  // series replicas appear, or the target shows both.
-  const singles = await findEventMappingsBySource(env.DB, source.id, event.id);
-  if (singles.length > 0) {
-    const removal = await deleteMappedReplicas(env, ctx.tokens, singles, budget);
-    processed += removal.processed;
-    errors.push(...removal.errors);
-    if (removal.retryLater) return { processed, errors, retryLater: true };
-  }
-
   if (event.status === "cancelled" || event.transparency === "transparent") {
+    // Nothing replaces them, so single replicas from when the id was a
+    // single event go too.
+    const singles = await findEventMappingsBySource(env.DB, source.id, event.id);
+    if (singles.length > 0) {
+      const singleRemoval = await deleteMappedReplicas(env, ctx.tokens, singles, budget);
+      processed += singleRemoval.processed;
+      errors.push(...singleRemoval.errors);
+      if (singleRemoval.retryLater) return { processed, errors, retryLater: true };
+    }
     const removal = await removeSeriesReplicas(ctx, event.id);
     return {
       processed: processed + removal.processed,
@@ -153,6 +152,24 @@ export async function processSeries(ctx: ReplicationContext, event: GoogleCalend
       fingerprint,
     });
     processed++;
+  }
+
+  // The id used to be a single event. Its single replicas go only once a
+  // replica series blocks the same time on that target, so a budget cut or
+  // failed insert never leaves the slot free. Checked on every call, whatever
+  // the fingerprints say: a cut after the insert must not strand a single.
+  const singles = await findEventMappingsBySource(env.DB, source.id, event.id);
+  if (singles.length > 0) {
+    const mappedTargets = new Set(
+      (await listSeriesMappingsForSource(env.DB, source.id, event.id)).map((m) => m.target_account_id),
+    );
+    const replaced = singles.filter((m) => mappedTargets.has(m.target_account_id));
+    if (replaced.length > 0) {
+      const removal = await deleteMappedReplicas(env, ctx.tokens, replaced, budget);
+      processed += removal.processed;
+      errors.push(...removal.errors);
+      if (removal.retryLater) return { processed, errors, retryLater: true };
+    }
   }
   return { processed, errors, retryLater: false };
 }
@@ -231,23 +248,6 @@ export async function processException(ctx: ReplicationContext, event: GoogleCal
     return deleteMappedReplicas(env, ctx.tokens, singles, budget);
   }
 
-  // Single replicas of this instance on a target that has a replica series
-  // would double its slot: busy exceptions replicated while the series was
-  // free, or a legacy per-instance replica. Targets without a replica series
-  // keep theirs, since nothing else blocks that time there.
-  let processed = 0;
-  const errors: string[] = [];
-  const mappedTargets = new Set(mapped.map((m) => m.target_account_id));
-  const singles = (await findEventMappingsBySource(env.DB, source.id, event.id)).filter((m) =>
-    mappedTargets.has(m.target_account_id),
-  );
-  if (singles.length > 0) {
-    const removal = await deleteMappedReplicas(env, ctx.tokens, singles, budget);
-    processed += removal.processed;
-    errors.push(...removal.errors);
-    if (removal.retryLater) return { processed, errors, retryLater: true };
-  }
-
   const key = originalStartKey(event);
   const fingerprint = exceptionFingerprint(event);
   // Confirming with the source's times also restores a replica instance
@@ -256,43 +256,80 @@ export async function processException(ctx: ReplicationContext, event: GoogleCal
     ? { status: "cancelled" }
     : { start: event.start, end: event.end, status: "confirmed" };
   const suffix = instanceSuffix(event.id, seriesId);
+  // Single replicas of this instance: busy exceptions replicated while the
+  // series was free, or a legacy per-instance replica. Each goes only once
+  // its target's replica instance is patched, so the slot is never free.
+  const singles = await findEventMappingsBySource(env.DB, source.id, event.id);
+  let processed = 0;
+  const errors: string[] = [];
 
   for (const mapping of mapped) {
     if (budget.exhausted) break;
     if ((await getExceptionFingerprint(env.DB, mapping.id, key)) === fingerprint) continue;
-    const targetToken = await ctx.tokens.get(mapping.target_account_id);
 
-    // Google's instance ids are <seriesId>_<original start>, which the
-    // replica shares with its source (undocumented, so a miss is looked up).
-    if (suffix !== null) {
-      try {
-        await patchEvent(targetToken, mapping.target_series_id + suffix, body);
-        budget.spend();
-        await upsertExceptionFingerprint(env.DB, mapping.id, key, fingerprint);
-        processed++;
-        continue;
-      } catch (err) {
-        if (!(err instanceof EventGoneError)) throw err;
-        budget.spend();
-        if (budget.exhausted) break;
-      }
-    }
-
-    const instance = await findInstanceByOriginalStart(targetToken, mapping.target_series_id, event.originalStartTime!);
-    budget.spend();
-    if (instance) {
-      if (budget.exhausted) break;
-      try {
-        await patchEvent(targetToken, instance.id, body);
-        budget.spend();
-        processed++;
-      } catch (err) {
-        if (!(err instanceof EventGoneError)) throw err;
-        budget.spend();
+    const outcome = await patchReplicaInstance(ctx, mapping, suffix, body, event.originalStartTime!);
+    if (outcome === "stopped") break;
+    if (outcome === "patched") {
+      processed++;
+      const replaced = singles.filter((m) => m.target_account_id === mapping.target_account_id);
+      if (replaced.length > 0) {
+        const removal = await deleteMappedReplicas(env, ctx.tokens, replaced, budget);
+        processed += removal.processed;
+        errors.push(...removal.errors);
+        if (removal.retryLater) return { processed, errors, retryLater: true };
+        // Each attempted delete either succeeds or reports an error; any left
+        // over were cut by the budget. No fingerprint then, so the next run
+        // patches again (harmless) and deletes them.
+        if (removal.processed + removal.errors.length < replaced.length) break;
       }
     }
     // Recorded even when no instance exists, so a resend doesn't look again.
+    // The singles then stay: they are that target's only block for the slot.
     await upsertExceptionFingerprint(env.DB, mapping.id, key, fingerprint);
   }
   return { processed, errors, retryLater: false };
+}
+
+/**
+ * PATCHes one target's replica instance: by derived id when the source id
+ * has the series' suffix, else (or when that id is gone) by one lookup on the
+ * original start. "stopped" means the budget ran out before it finished.
+ */
+async function patchReplicaInstance(
+  ctx: ReplicationContext,
+  mapping: SeriesMappingRow,
+  suffix: string | null,
+  body: Record<string, unknown>,
+  originalStart: GoogleEventDateTime,
+): Promise<"patched" | "missing" | "stopped"> {
+  const { budget } = ctx;
+  const targetToken = await ctx.tokens.get(mapping.target_account_id);
+
+  // Google's instance ids are <seriesId>_<original start>, which the
+  // replica shares with its source (undocumented, so a miss is looked up).
+  if (suffix !== null) {
+    try {
+      await patchEvent(targetToken, mapping.target_series_id + suffix, body);
+      budget.spend();
+      return "patched";
+    } catch (err) {
+      if (!(err instanceof EventGoneError)) throw err;
+      budget.spend();
+      if (budget.exhausted) return "stopped";
+    }
+  }
+
+  const instance = await findInstanceByOriginalStart(targetToken, mapping.target_series_id, originalStart);
+  budget.spend();
+  if (!instance) return "missing";
+  if (budget.exhausted) return "stopped";
+  try {
+    await patchEvent(targetToken, instance.id, body);
+    budget.spend();
+    return "patched";
+  } catch (err) {
+    if (!(err instanceof EventGoneError)) throw err;
+    budget.spend();
+    return "missing";
+  }
 }

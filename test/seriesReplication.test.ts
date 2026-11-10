@@ -200,46 +200,69 @@ it("an all-day series needs no time zone lookup", async () => {
   for (const insert of mock.inserts) expect(insert.body.start).toEqual({ date: "2026-11-24" });
 });
 
-it("a single event that becomes a series loses its single replicas first", async () => {
-  const s = await setup();
-  for (const target of [s.primary, s.side]) {
+async function singleReplicasOf(s: Setup, sourceEventId: string, targets: TestAccount[]): Promise<void> {
+  for (const target of targets) {
     await createEventMapping(env.DB, {
       id: crypto.randomUUID(),
       userId: s.userId,
       sourceAccountId: s.biz.id,
-      sourceEventId: "ev-converted",
+      sourceEventId,
       targetAccountId: target.id,
       targetEventId: `single-replica-${target.accessToken}`,
     });
   }
+}
+
+it("a single event that becomes a series loses its single replicas once the series replaces them", async () => {
+  const s = await setup();
+  await singleReplicasOf(s, "ev-converted", [s.primary, s.side]);
 
   const result = await processSeries(await context(s, s.biz.id), weeklySeries("ev-converted"));
 
   expect(mock.deletes.map((d) => d.eventId).sort()).toEqual(["single-replica-tok-primary", "single-replica-tok-side"]);
   expect(mock.inserts).toHaveLength(2);
   const calls = googleCalls().filter((c) => !c.startsWith("GET"));
-  expect(calls.map((c) => c.split(" ")[0])).toEqual(["DELETE", "DELETE", "POST", "POST"]);
+  expect(calls.map((c) => c.split(" ")[0])).toEqual(["POST", "POST", "DELETE", "DELETE"]);
   expect(await findEventMappingsBySource(env.DB, s.biz.id, "ev-converted")).toHaveLength(0);
   expect(result.processed).toBe(4);
 });
 
-it("a failed delete of a single replica stops before any series insert", async () => {
+it("a budget cut after the series inserts keeps the singles, and the next run removes them without inserting again", async () => {
   const s = await setup();
-  await createEventMapping(env.DB, {
-    id: crypto.randomUUID(),
-    userId: s.userId,
-    sourceAccountId: s.biz.id,
-    sourceEventId: "ev-stuck",
-    targetAccountId: s.primary.id,
-    targetEventId: "single-replica-stuck",
-  });
+  await singleReplicasOf(s, "ev-cut", [s.primary, s.side]);
+
+  await processSeries(await context(s, s.biz.id, new CallBudget(2)), weeklySeries("ev-cut"));
+
+  expect(mock.inserts).toHaveLength(2);
+  expect(mock.deletes).toHaveLength(0);
+  expect(await findEventMappingsBySource(env.DB, s.biz.id, "ev-cut")).toHaveLength(2);
+
+  const result = await processSeries(await context(s, s.biz.id), weeklySeries("ev-cut"));
+
+  expect(result).toMatchObject({ processed: 2, retryLater: false });
+  expect(mock.inserts).toHaveLength(2);
+  expect(mock.deletes.map((d) => d.eventId).sort()).toEqual(["single-replica-tok-primary", "single-replica-tok-side"]);
+  expect(await findEventMappingsBySource(env.DB, s.biz.id, "ev-cut")).toHaveLength(0);
+});
+
+it("a failed single replica delete after the series insert is retried without a second insert", async () => {
+  const s = await setup();
+  await singleReplicasOf(s, "ev-stuck", [s.primary]);
   mock.failDeletes(403);
 
   const result = await processSeries(await context(s, s.biz.id), weeklySeries("ev-stuck"));
 
   expect(result.retryLater).toBe(true);
-  expect(mock.inserts).toHaveLength(0);
-  expect(await listSeriesMappingsForSource(env.DB, s.biz.id, "ev-stuck")).toHaveLength(0);
+  expect(mock.inserts).toHaveLength(2);
+  expect(await listSeriesMappingsForSource(env.DB, s.biz.id, "ev-stuck")).toHaveLength(2);
+  expect(await findEventMappingsBySource(env.DB, s.biz.id, "ev-stuck")).toHaveLength(1);
+
+  mock.failDeletes(null);
+  await processSeries(await context(s, s.biz.id), weeklySeries("ev-stuck"));
+
+  expect(mock.inserts).toHaveLength(2);
+  expect(mock.deletes.map((d) => d.eventId)).toEqual(["single-replica-tok-primary"]);
+  expect(await findEventMappingsBySource(env.DB, s.biz.id, "ev-stuck")).toHaveLength(0);
 });
 
 it("a budget cut between targets resumes without a second replica series", async () => {
@@ -558,6 +581,9 @@ it("a busy exception with an existing single replica on a mapped target loses th
 
   expect(mock.deletes.map((d) => d.eventId)).toEqual(["single-replica-primary"]);
   expect(await findEventMappingsBySource(env.DB, s.biz.id, moved.id)).toHaveLength(0);
+  // Replaced before removed: the primary's instance is patched first.
+  const writes = googleCalls().filter((c) => c.startsWith("PATCH") || c.startsWith("DELETE"));
+  expect(writes.map((c) => c.split(" ")[0])).toEqual(["PATCH", "DELETE", "PATCH"]);
   expect(mock.patches.map((p) => p.eventId).sort()).toEqual(
     [...replicas.values()].map((id) => `${id}${DEC1_SUFFIX}`).sort(),
   );
@@ -613,4 +639,43 @@ it("an exhausted budget makes no Google call", async () => {
 
   expect(googleCalls().length).toBe(callsBefore);
   expect(result.processed).toBe(0);
+});
+
+it("a budget cut between the instance patch and the single delete never leaves the moved time free", async () => {
+  const s = await setup();
+  await replicateSeries(s, "ser-cutdel");
+  const moved = exceptionOf("ser-cutdel");
+  await singleReplicasOf(s, moved.id, [s.primary]);
+  const primaryMapping = (await findSeriesMapping(env.DB, s.biz.id, "ser-cutdel", s.primary.id))!;
+
+  await processException(await context(s, s.biz.id, new CallBudget(1)), moved);
+
+  expect(mock.patches.map((p) => p.accessToken)).toEqual(["tok-primary"]);
+  expect(mock.deletes).toHaveLength(0);
+  expect(await findEventMappingsBySource(env.DB, s.biz.id, moved.id)).toHaveLength(1);
+  expect(await getExceptionFingerprint(env.DB, primaryMapping.id, DEC1_START)).toBeNull();
+
+  await processException(await context(s, s.biz.id), moved);
+
+  expect(mock.deletes.map((d) => d.eventId)).toEqual(["single-replica-tok-primary"]);
+  expect(await findEventMappingsBySource(env.DB, s.biz.id, moved.id)).toHaveLength(0);
+  expect(mock.patches.map((p) => p.accessToken)).toEqual(["tok-primary", "tok-primary", "tok-side"]);
+  expect(await getExceptionFingerprint(env.DB, primaryMapping.id, DEC1_START)).toBe(exceptionFingerprint(moved));
+});
+
+it("a replica instance that can't be found keeps the target's single replica", async () => {
+  const s = await setup();
+  const replicas = await replicateSeries(s, "ser-nofind");
+  const moved = exceptionOf("ser-nofind");
+  await singleReplicasOf(s, moved.id, [s.primary]);
+  // Gone by derived id, and the lookup finds nothing.
+  mock.makeNextPatchGone(`${replicas.get(s.primary.id)!}${DEC1_SUFFIX}`);
+
+  const result = await processException(await context(s, s.biz.id), moved);
+
+  expect(result).toMatchObject({ processed: 1, retryLater: false });
+  expect(mock.deletes).toHaveLength(0);
+  expect(await findEventMappingsBySource(env.DB, s.biz.id, moved.id)).toHaveLength(1);
+  const primaryMapping = (await findSeriesMapping(env.DB, s.biz.id, "ser-nofind", s.primary.id))!;
+  expect(await getExceptionFingerprint(env.DB, primaryMapping.id, DEC1_START)).toBe(exceptionFingerprint(moved));
 });
