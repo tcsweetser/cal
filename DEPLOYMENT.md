@@ -185,7 +185,7 @@ The deploy applies migration 0010 (new tables only) before the new code runs. Th
 
 1. Legacy drain. Items already in `sync_queue` are handled the old way, so no queued cancellation is lost.
 2. Reset. On the tick the queue empties, the account's sync positions are cleared and its old instance mappings are queued in `legacy_instance_cleanup`.
-3. Full fetch. On the next tick, one fetch returns every live series and every one-off event. Series replicas are created, about 50 Google calls in total. Single events that already have a replica are patched in place.
+3. Full fetch. On the next tick (if the queue was already empty, the reset and the full fetch happen in the same tick), one fetch returns every live series and every one-off event. Series replicas are created, about 50 Google calls in total. Single events that already have a replica are patched in place.
 4. `series_cutover.completed_at` is set once the queue is empty and a new sync position has been saved after the reset.
 5. Cleanup. Old future instance replicas for all accounts are deleted first, then the past ones. A legacy row is deleted only when its target already has a replica series for that meeting.
 
