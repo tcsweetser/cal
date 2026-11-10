@@ -63,16 +63,21 @@ export function exceptionFingerprint(event: GoogleCalendarEvent): string {
   });
 }
 
-/** Sort key for a fetch before enqueueing: series, cancelled stubs, exceptions, singles. */
+/**
+ * Sort key for a fetch before enqueueing: series, cancelled stubs, singles,
+ * exceptions. An exception waits while its series id is queued, and a series
+ * made "does not repeat" keeps its id and arrives as a single, so singles must
+ * drain first or that exception waits on every tick.
+ */
 export function queueOrder(event: GoogleCalendarEvent): number {
   switch (classifyEvent(event)) {
     case "series":
       return 0;
     case "cancelled-top-level":
       return 1;
-    case "exception":
-      return 2;
     case "single":
+      return 2;
+    case "exception":
       return 3;
   }
 }

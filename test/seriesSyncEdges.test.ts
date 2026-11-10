@@ -9,6 +9,7 @@ import { exceptionFingerprint, seriesFingerprint } from "../src/services/recurre
 import { GoogleCalendarMock } from "./helpers/googleMock";
 import { meteredDb } from "./helpers/meteredD1";
 import {
+  cancelledInstance,
   hoursFromNow,
   lastSyncLog,
   movedInstance,
@@ -288,4 +289,44 @@ it("an ended single with series mappings loses its replica series and gets no si
   expect(mock.inserts).toHaveLength(0);
   expect(await listSeriesMappingsForSource(env.DB, s.biz.id, "ser-pastsingle")).toHaveLength(0);
   expect(await findEventMappingsBySource(env.DB, s.biz.id, "ser-pastsingle")).toHaveLength(0);
+});
+
+// --- Queue order across kinds ---
+
+it("a series made \"does not repeat\" drains as a single before its old exceptions, so they never wait on it", async () => {
+  const s = await seriesSetup();
+  // Free, so it has no replica series on any target.
+  mock.queueList("tok-biz", {
+    events: [weeklySeries("ser-conv", { transparency: "transparent" })],
+    nextSyncToken: "biz-token-conv1",
+  });
+  await runFullSync(env, s.userId);
+  expect(mock.inserts).toHaveLength(0);
+  // A busy instance replicated as a single while the series was free.
+  const cancelled = cancelledInstance("ser-conv", occurrence(1));
+  await seedSingleMapping(s, cancelled.id, "instance-single");
+
+  // Same id, now a busy single, plus one cancelled instance of the old series.
+  mock.queueList("tok-biz", {
+    events: [
+      cancelled,
+      {
+        id: "ser-conv",
+        status: "confirmed",
+        transparency: "opaque",
+        start: { dateTime: hoursFromNow(24) },
+        end: { dateTime: hoursFromNow(25) },
+      },
+    ],
+    nextSyncToken: "biz-token-conv2",
+  });
+  await runFullSync(env, s.userId);
+
+  expect(mock.inserts.map((i) => i.accessToken).sort()).toEqual(["tok-primary", "tok-side"]);
+  for (const insert of mock.inserts) expect(insert.body.recurrence).toBeUndefined();
+  expect(await findEventMappingsBySource(env.DB, s.biz.id, "ser-conv")).toHaveLength(2);
+  // The cancelled instance falls through to the single path and removes its replica.
+  expect(mock.deletes.map((d) => d.eventId)).toEqual(["instance-single"]);
+  expect(await queuedCount(s.biz.id)).toBe(0);
+  expect(await lastSyncLog(s.userId)).toEqual({ status: "success", message: null });
 });

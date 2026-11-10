@@ -30,14 +30,16 @@ describe("classifyEvent", () => {
     ).toBe("exception");
   });
 
-  it("orders series, cancelled stubs, exceptions, singles", () => {
+  // A series made "does not repeat" keeps its id and arrives as a single, so
+  // singles go before exceptions, which may wait on their series id.
+  it("orders series, cancelled stubs, singles, exceptions", () => {
     const evs: GoogleCalendarEvent[] = [
       { id: "s", start },
       { id: "e_1", recurringEventId: "e" },
       { id: "c", status: "cancelled" },
       { id: "r", recurrence: ["RRULE:FREQ=DAILY"] },
     ];
-    expect(evs.sort((a, b) => queueOrder(a) - queueOrder(b)).map((e) => e.id)).toEqual(["r", "c", "e_1", "s"]);
+    expect(evs.sort((a, b) => queueOrder(a) - queueOrder(b)).map((e) => e.id)).toEqual(["r", "c", "s", "e_1"]);
   });
 });
 

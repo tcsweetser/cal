@@ -223,7 +223,8 @@ export async function processException(ctx: ReplicationContext, event: GoogleCal
     if (mapping) mapped.push(mapping);
     else anyUnmapped = true;
   }
-  // Its series drains first (queue order), so it gets a replica soon.
+  // Its series id drains first (queue order: as a series, a cancelled stub,
+  // or a single), so this waits at most until that item is done.
   if (anyUnmapped && (await isEventQueued(env.DB, source.id, seriesId))) {
     return { processed: 0, errors: [], retryLater: true };
   }
