@@ -33,9 +33,11 @@ export class GoogleCalendarMock {
   // triggers reconciliation without configuring this should fail loudly, not
   // silently assume an answer.
   private eventExistence = new Map<string, boolean>();
-  // originEventIds whose insert should always 500 (see the POST handler) —
-  // simulates an event that can never be created, for per-event isolation tests.
-  private poisonedOriginEventIds = new Set<string>();
+  // originEventIds whose insert should always fail with the given status (see
+  // the POST handler) — for per-event isolation and failure-handling tests.
+  private poisonedOriginEventIds = new Map<string, number>();
+  // When set, every DELETE fails with this status.
+  private deleteFailureStatus: number | null = null;
   // Unlike poisonedOriginEventIds (keyed off sync-engine metadata a booking/
   // poll insert never sets), this fails *every* insert regardless of body —
   // for tests simulating a Google failure on the one-off placeholder events
@@ -80,8 +82,17 @@ export class GoogleCalendarMock {
     this.eventExistence.set(eventId, exists);
   }
 
-  poisonInsertsForEvent(originEventId: string) {
-    this.poisonedOriginEventIds.add(originEventId);
+  // Default 400: Google rejecting the event itself, so it can never be created.
+  poisonInsertsForEvent(originEventId: string, status = 400) {
+    this.poisonedOriginEventIds.set(originEventId, status);
+  }
+
+  healInsertsForEvent(originEventId: string) {
+    this.poisonedOriginEventIds.delete(originEventId);
+  }
+
+  failDeletes(status: number | null) {
+    this.deleteFailureStatus = status;
   }
 
   poisonAllInserts() {
@@ -132,11 +143,10 @@ export class GoogleCalendarMock {
           conferenceData?: { createRequest?: { requestId?: string } };
         };
         const originEventId = body.extendedProperties?.private?.originEventId;
-        // Persistent (not consumed) so retries inside googleFetch also fail —
-        // simulates an event that can genuinely never be inserted, not a
-        // transient blip that a retry would paper over.
-        if (originEventId && this.poisonedOriginEventIds.has(originEventId)) {
-          return new Response("Internal Server Error", { status: 500 });
+        // Persistent (not consumed) so retries inside googleFetch also fail.
+        const poisonStatus = originEventId ? this.poisonedOriginEventIds.get(originEventId) : undefined;
+        if (poisonStatus !== undefined) {
+          return new Response("Poisoned insert", { status: poisonStatus });
         }
         this.inserts.push({ accessToken, body });
         const id = `mock-event-${this.nextId++}`;
@@ -187,6 +197,9 @@ export class GoogleCalendarMock {
       }
 
       if (patchMatch && method === "DELETE") {
+        if (this.deleteFailureStatus !== null) {
+          return new Response("Failed delete", { status: this.deleteFailureStatus });
+        }
         const eventId = decodeURIComponent(patchMatch[1]!);
         this.deletes.push({ accessToken, eventId });
         return new Response(null, { status: 204 });

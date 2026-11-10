@@ -34,6 +34,7 @@ import {
   getEvent,
   SyncTokenExpiredError,
   EventGoneError,
+  GoogleApiError,
   type GoogleCalendarEvent,
   type EventsDeltaResult,
 } from "./googleCalendar";
@@ -166,6 +167,20 @@ function errMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
 
+// 4xx statuses about the account, quota or request rather than this event.
+// Google uses 403 for rate limits as well as permissions.
+const NON_EVENT_4XX = new Set([401, 403, 408, 429]);
+
+// True only when the event itself can't be processed, so retrying can never
+// help and it's safe to drop from the queue. Anything else (an outage, an auth
+// or token failure, the Workers subrequest cap) says nothing about the event:
+// dropping it would lose the work, because the syncToken still advances once
+// the queue is empty and Google won't send that change again.
+function isUnprocessableEvent(err: unknown): boolean {
+  if (err instanceof SyntaxError) return true; // corrupt event_json
+  return err instanceof GoogleApiError && err.status >= 400 && err.status < 500 && !NON_EVENT_4XX.has(err.status);
+}
+
 // plan.md §5.3 step 5's topology table, role-only (tag never affects this).
 function targetsFor(
   source: AccountRow,
@@ -188,6 +203,9 @@ function targetsFor(
 interface BatchResult {
   processed: number;
   errors: string[];
+  // Something failed for a reason that may clear, so the caller should keep
+  // its queue item for a later run.
+  retryLater?: boolean;
 }
 
 // Isolated per mapping: one bad delete (a genuine network/API error, not the
@@ -203,6 +221,7 @@ async function deleteMappedReplicas(
   budget: CallBudget,
 ): Promise<BatchResult> {
   let processed = 0;
+  let retryLater = false;
   const errors: string[] = [];
   for (const mapping of mappings) {
     if (budget.exhausted) break;
@@ -214,9 +233,10 @@ async function deleteMappedReplicas(
       processed++;
     } catch (err) {
       errors.push(`mapping ${mapping.id}: ${errMessage(err)}`);
+      if (!isUnprocessableEvent(err)) retryLater = true;
     }
   }
-  return { processed, errors };
+  return { processed, errors, retryLater };
 }
 
 function buildReplicaPayload(userId: string, source: AccountRow, event: GoogleCalendarEvent, summary: string) {
@@ -453,7 +473,7 @@ async function syncAccount(
   // partway through leaves it there to resume from cleanly next time
   // (processCreateOrUpdate is idempotent per target, so a partially-done
   // event costs at most a few redundant PATCHes on retry, never a duplicate).
-  while (!budget.exhausted) {
+  drain: while (!budget.exhausted) {
     const batch = await dequeuePendingEvents(env.DB, account.id, QUEUE_DRAIN_BATCH_SIZE);
     if (batch.length === 0) break;
     for (const item of batch) {
@@ -465,23 +485,27 @@ async function syncAccount(
           const removal = await deleteMappedReplicas(env, tokens, mappings, budget);
           processed += removal.processed;
           errors.push(...removal.errors);
+          if (removal.retryLater) break drain;
         } else if (event.transparency === "transparent") {
           const mappings = await findEventMappingsBySource(env.DB, account.id, event.id);
           if (mappings.length > 0) {
             const removal = await deleteMappedReplicas(env, tokens, mappings, budget);
             processed += removal.processed;
             errors.push(...removal.errors);
+            if (removal.retryLater) break drain;
           }
         } else {
           processed += await processCreateOrUpdate(env, tokens, userId, account, event, allAccounts, budget);
         }
         if (!budget.exhausted) await deleteQueuedEvent(env.DB, item.id);
       } catch (err) {
-        // A genuinely bad event (malformed payload Google rejects, etc.) —
-        // isolate it like the old per-event loop did, and still remove it
-        // from the queue so it can't wedge every future drain on the same
-        // failure forever.
         errors.push(`event ${item.event_id}: ${errMessage(err)}`);
+        // Stop rather than move on: the same failure would hit the rest of
+        // the queue, and the call budget only counts successful calls.
+        if (!isUnprocessableEvent(err)) break drain;
+        // A genuinely bad event (malformed payload Google rejects, etc.) —
+        // remove it from the queue so it can't wedge every future drain on
+        // the same failure forever.
         await deleteQueuedEvent(env.DB, item.id);
       }
     }

@@ -65,6 +65,19 @@ export class EventGoneError extends Error {
   }
 }
 
+// Carries the HTTP status so the sync queue can tell Google rejecting an event
+// apart from an outage, an auth problem or a rate limit.
+export class GoogleApiError extends Error {
+  constructor(
+    operation: string,
+    public readonly status: number,
+    body: string,
+  ) {
+    super(`Google Calendar ${operation} failed: ${status} ${body}`);
+    this.name = "GoogleApiError";
+  }
+}
+
 async function sleep(ms: number): Promise<void> {
   await new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -191,7 +204,7 @@ export async function insertEvent(
     headers: { Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json" },
     body: JSON.stringify(body),
   });
-  if (!res.ok) throw new Error(`Google Calendar insert failed: ${res.status} ${await res.text()}`);
+  if (!res.ok) throw new GoogleApiError("insert", res.status, await res.text());
   return res.json<GoogleCalendarEvent>();
 }
 
@@ -271,7 +284,7 @@ export async function patchEvent(
     body: JSON.stringify(body),
   });
   if (res.status === 404 || res.status === 410) throw new EventGoneError(eventId);
-  if (!res.ok) throw new Error(`Google Calendar patch failed: ${res.status} ${await res.text()}`);
+  if (!res.ok) throw new GoogleApiError("patch", res.status, await res.text());
   return res.json<GoogleCalendarEvent>();
 }
 
@@ -285,7 +298,7 @@ export async function deleteEvent(accessToken: string, eventId: string): Promise
     headers: { Authorization: `Bearer ${accessToken}` },
   });
   if (!res.ok && res.status !== 404 && res.status !== 410) {
-    throw new Error(`Google Calendar delete failed: ${res.status} ${await res.text()}`);
+    throw new GoogleApiError("delete", res.status, await res.text());
   }
 }
 
