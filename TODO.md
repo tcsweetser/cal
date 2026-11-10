@@ -1,5 +1,40 @@
 # TODO
 
+Triaged 2026-11-10. P0: handle now. P1: next. P2: can wait. Details for the queue and resource items are in `task_plan.md` under "D1 incident follow-up bundle (2026-11-10)".
+
+## P0
+
+- [ ] Confirm the D1 fix in production. On or after 2026-11-11 01:00 UTC, `npx wrangler d1 info cal-replication-db -c wrangler.local.jsonc` should show `rows_read_24h` in the low thousands (it was 3,634,237). The 5M/day limit is account-wide, so HIT Pacific's production database shares it.
+
+## P1
+
+- [ ] One-off events more than 42 days ahead are never replicated. The window filter drops them, the sync token advances, and only recurring series have the daily audit to pick them up later. Moving an event beyond the window has the same cause and leaves its replica at the old time. Known since August (`task_plan.md`, "pre-existing structural gap") but never tracked. Anything booked 6+ weeks ahead doesn't block the other calendars.
+- [ ] Retry counter or per-target parking, plus an alert on repeated error runs. Today one persistently failing target (5xx, 401, 403, or no stored tokens) holds every source queue that replicates to it, and only the logs page shows it.
+- [ ] Booking slot picker builds a new `Intl.DateTimeFormat` per candidate, up to 1,344 per request. Measured 35-75 ms in Node against the 10 ms Free CPU limit, so invitees may get error 1102. Fix: one formatter per time zone. Confirm in production observability first.
+- [ ] Settle the D1 calls-per-invocation limit on Free: the D1 docs page says 50, the Workers page says 1,000. The code assumes 1,000; if 50 is enforced, large deltas and the drain loop are already at risk.
+
+## P2
+
+Sync correctness, rare paths:
+- [ ] Deterministic client-supplied event ids, so a retried insert can't create a second replica. Check Google's id rules and deleted-id behaviour first.
+- [ ] A failed re-fetch after a 410 loses reconciliation, and a 5xx on a reconciliation delete isn't retried.
+- [ ] Track recurring series before enqueueing, so a failed tracking batch can't lose the series. Small reorder in `syncAccount`.
+- [ ] Mass cancellations (a deleted long series) bypass `CallBudget` and can reach the D1 call cap, leaving the lock stuck for 15 minutes. Self-heals over later ticks.
+- [ ] Changes made while a target was revoked aren't replayed when it reconnects.
+- [ ] `CallBudget` doesn't count list pages, retries or token refreshes, so the 50-subrequest cap is reachable. Since the drain fix this stalls a run instead of losing events.
+
+Resource use, none near a limit today:
+- [ ] Sync-token churn: 5 rows written per account per tick even when nothing changed (82% of rows written, 3.6% of the daily limit).
+- [ ] A failed KV write in `refreshTokens` discards the freshly issued token. Only matters if the account-wide 1,000 KV writes/day is reached.
+- [ ] Email send caps are check-then-act, and invite/poll lists are uncapped (more than about 40 recipients exceeds the 50-subrequest cap partway).
+
+Process:
+- [ ] Dev branch + PR gate, so nothing reaches `master` (and therefore production) without review. Plan written up, nothing implemented yet: see `task_plan.md`'s "Phase 8 (planned, not started): dev branch workflow + PR gate". Scoped to git branch protection + a `dev` branch + a basic Actions CI check for now — a proper staging Cloudflare Worker/D1/KV and PR automation (preview URLs, etc.) are explicitly deferred to a later pass.
+
+## Done
+
+- [x] D1 rows_read incident (2026-11-10): `sync_logs` lock checks scanned the whole table on every tick, 3.6M rows/day against the 5M account-wide limit. Fixed with a partial index (migration 0009, `974c5cf`), then a follow-up bundle pushed as `bfd3407`: capped `Retry-After`, queue existence checks, batched recurring-series writes, and a queue drain that no longer drops events on transient failures.
+
 - [x] Fix: all 4 secondary accounts silently going `revoked` in production — root-caused (not a code bug): Google caps refresh tokens at 7 days for OAuth apps in "Testing" publishing status with sensitive scopes, and `DEPLOYMENT.md` had wrongly said Testing status was fine indefinitely (now corrected). Fixed by adding a `/privacy` page (required by Google's Branding form; pushed separately, `8ab8f3e`) and publishing the OAuth app to "In production" via Google Cloud Console. A second bug surfaced during reconnect (connect flow 409'd on any existing row, even a revoked one, with no recovery path) — fixed and pushed (`60b5931`) with a regression test (`test/authReconnect.test.ts`). All 5 accounts (primary + 4 secondaries) confirmed `active` in production D1. Full writeup in `task_plan.md`'s "Production incident (2026-08-21)" section. **Fully resolved.**
 
 - [x] UI redesign: integrate `docs/mockups/CAL_UI_Mockups.html` into the real Hono JSX views — Implemented (Phase 9 in `task_plan.md`): sidebar shell + centered public-card shell sharing one design-token system, real Google name/photo in the sidebar (new `profile` OAuth scope, `migrations/0008_user_profile.sql`), badge-tier fixes for all real status enums, booking's slot picker restyled to radio rows. 77/77 tests passing, `tsc`/`wrangler --dry-run` clean, smoke-tested via `wrangler dev` + curl (no browser extension available to visually confirm — recommend a manual click-through soon). Not committed yet.
@@ -19,23 +54,3 @@ Should be create a test/prod branch structure?
   - **Second gotcha, same session**: clicking through the live site turned up `D1_ERROR: no such table` on `/dashboard/settings`, `/invites`, `/meeting-polls` — migrations 0005-0007 had been merged (Phase 7.1-7.3) but never applied to production D1, because `wrangler deploy` only ships code/bindings and never touches D1 schema on its own; that's a manual step, always was. Fixed by running `wrangler d1 migrations apply cal-replication-db --remote` by hand, then folding a migrations step into the production trigger's deploy command (see `DEPLOYMENT.md`'s "Continuous deployment" section) so future migrations apply automatically on every push to `master` — accepted the tradeoff of no review gate on schema changes now (mitigated by this project's migrations convention of always additive `IF NOT EXISTS`), rather than wait for Phase 8's PR gate below.
 
 ~~Delete the comparison document from the repo, repo history and any commits.~~ Done — `COMPARISON.md` was never committed (confirmed via `git log --all -- COMPARISON.md`, no hits), so it was just deleted from disk; no history rewrite was needed.
-
-- [ ] Dev branch + PR gate, so nothing reaches `master` (and therefore production) without review. Plan written up, nothing implemented yet: see `task_plan.md`'s "Phase 8 (planned, not started): dev branch workflow + PR gate". Scoped to git branch protection + a `dev` branch + a basic Actions CI check for now — a proper staging Cloudflare Worker/D1/KV and PR automation (preview URLs, etc.) are explicitly deferred to a later pass.
-
-
-Resource audit follow-ups (2026-11-10, none near a limit today; see `task_plan.md`):
-- [ ] Sync-token churn: 5 rows written per account per tick even when nothing changed (82% of rows written)
-- [ ] A failed KV write in `refreshTokens` discards the freshly issued token
-- [ ] Reuse one `Intl.DateTimeFormat` per time zone in the slot picker (may exceed the 10 ms CPU limit)
-- [ ] Email send caps are check-then-act, and invite/poll lists are uncapped
-- [ ] `CallBudget` doesn't count list pages, retries or token refreshes, so the 50-subrequest cap is reachable
-
-Queue failure handling follow-ups (2026-11-10 review; see `task_plan.md`):
-- [ ] Retry counter or per-target parking, so one persistently failing target can't hold every source queue
-- [ ] Deterministic client-supplied event ids, so a retried insert can't create a second replica (check Google's id rules and deleted-id behaviour first)
-- [ ] Moving an event outside the 42-day window leaves its replica at the old time (pre-existing)
-- [ ] A failed re-fetch after a 410 loses reconciliation; a 5xx on a reconciliation delete isn't retried (pre-existing)
-- [ ] Track recurring series before enqueueing, so a failed tracking batch can't lose the series (pre-existing)
-- [ ] Mass cancellations bypass `CallBudget` and can reach the D1 call cap (pre-existing)
-- [ ] Changes during a target's revoked window aren't replayed on reconnect (pre-existing)
-- [ ] Cloudflare docs disagree on D1 calls per invocation on Free (50 on the D1 page, 1,000 on the Workers page); the code assumes 1,000
