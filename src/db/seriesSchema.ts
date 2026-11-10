@@ -59,6 +59,33 @@ export async function listSeriesMappingsForSource(
   return results;
 }
 
+// D1 binds at most 100 parameters per statement.
+const SERIES_ID_CHUNK = 90;
+
+// Which of these source series already have a replica series on some target.
+// An IN list on the (source_account_id, source_series_id) index prefix: reads
+// only the matching mapping rows, in ceil(n / 90) queries.
+export async function listMappedSeriesIds(
+  db: D1Database,
+  sourceAccountId: string,
+  seriesIds: string[],
+): Promise<Set<string>> {
+  const mapped = new Set<string>();
+  for (let i = 0; i < seriesIds.length; i += SERIES_ID_CHUNK) {
+    const chunk = seriesIds.slice(i, i + SERIES_ID_CHUNK);
+    const marks = chunk.map(() => "?").join(", ");
+    const { results } = await db
+      .prepare(
+        `SELECT DISTINCT source_series_id FROM series_mappings
+         WHERE source_account_id = ? AND source_series_id IN (${marks})`,
+      )
+      .bind(sourceAccountId, ...chunk)
+      .all<{ source_series_id: string }>();
+    for (const row of results) mapped.add(row.source_series_id);
+  }
+  return mapped;
+}
+
 // Used only by 410 recovery: every series replicated from one account.
 export async function listSeriesIdsForSourceAccount(db: D1Database, sourceAccountId: string): Promise<string[]> {
   const { results } = await db

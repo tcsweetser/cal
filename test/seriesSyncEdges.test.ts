@@ -296,6 +296,13 @@ it("an ended single with series mappings loses its replica series and gets no si
 
 // --- Queue order across kinds ---
 
+// "METHOD" of every Google write so far, in order.
+function googleWriteMethods(): string[] {
+  return googleCalls()
+    .map((c) => c.split(" ")[0]!)
+    .filter((m) => m !== "GET");
+}
+
 it("a series made \"does not repeat\" drains as a single before its old exceptions, so they never wait on it", async () => {
   const s = await seriesSetup();
   // Free, so it has no replica series on any target.
@@ -332,6 +339,28 @@ it("a series made \"does not repeat\" drains as a single before its old exceptio
   expect(mock.deletes.map((d) => d.eventId)).toEqual(["instance-single"]);
   expect(await queuedCount(s.biz.id)).toBe(0);
   expect(await lastSyncLog(s.userId)).toEqual({ status: "success", message: null });
+});
+
+it("a \"this and following\" split creates the new half's replica series before truncating the old one", async () => {
+  const s = await seriesSetup();
+  mock.queueList("tok-biz", { events: [weeklySeries("ser-split")], nextSyncToken: "biz-token-split1" });
+  await runFullSync(env, s.userId);
+  const oldReplicas = (await listSeriesMappingsForSource(env.DB, s.biz.id, "ser-split")).map((m) => m.target_series_id);
+  const writesBefore = googleWriteMethods().length;
+
+  // Google lists the truncated original first.
+  const truncated = weeklySeries("ser-split", { recurrence: ["RRULE:FREQ=WEEKLY;BYDAY=TU;UNTIL=20261207T135959Z"] });
+  const laterHalf = weeklySeries("ser-split_R20261208T230000", {
+    start: { dateTime: "2026-12-09T09:00:00+10:00", timeZone: "Australia/Brisbane" },
+    end: { dateTime: "2026-12-09T10:00:00+10:00", timeZone: "Australia/Brisbane" },
+  });
+  mock.queueList("tok-biz", { events: [truncated, laterHalf], nextSyncToken: "biz-token-split2" });
+  await runFullSync(env, s.userId);
+
+  expect(googleWriteMethods().slice(writesBefore)).toEqual(["POST", "POST", "PATCH", "PATCH"]);
+  expect(mock.patches.map((p) => p.eventId).sort()).toEqual([...oldReplicas].sort());
+  expect(await listSeriesMappingsForSource(env.DB, s.biz.id, "ser-split_R20261208T230000")).toHaveLength(2);
+  expect(await queuedCount(s.biz.id)).toBe(0);
 });
 
 it("an exception without an original start is dropped with an error instead of wedging the queue", async () => {

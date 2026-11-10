@@ -10,6 +10,7 @@ import {
   isEventQueued,
   isReplicaSeries,
   listLegacyCleanup,
+  listMappedSeriesIds,
   markCutoverReset,
   upsertExceptionFingerprint,
 } from "../src/db/seriesSchema";
@@ -223,3 +224,26 @@ it("per-tick lookups read a bounded number of rows", async () => {
   for (const call of metered.calls) expect(call.rowsRead).toBeLessThan(5);
 });
 
+it("listMappedSeriesIds returns which of a fetch's series already have a replica, at a cost set by the fetch, not the table", async () => {
+  const { userId, source, target } = await setup();
+  const mapStmt = env.DB.prepare(
+    `INSERT INTO series_mappings
+     (id, user_id, source_account_id, source_series_id, target_account_id, target_series_id, fingerprint)
+     VALUES (?, ?, ?, ?, ?, ?, 'fp')`,
+  );
+  await env.DB.batch(
+    Array.from({ length: 1000 }, (_, i) => mapStmt.bind(crypto.randomUUID(), userId, source.id, `ser${i}`, target.id, `tser${i}`)),
+  );
+  // More ids than one statement can bind.
+  const asked = ["ser10", "ser250", ...Array.from({ length: 120 }, (_, i) => `new-${i}`)];
+  const metered = meteredDb(env.DB);
+
+  const mapped = await listMappedSeriesIds(metered.db, source.id, asked);
+
+  expect([...mapped].sort()).toEqual(["ser10", "ser250"]);
+  expect(metered.calls).toHaveLength(2);
+  // D1 counts about two rows per IN value (the value list, then the probe).
+  const rowsRead = metered.calls.reduce((n, c) => n + c.rowsRead, 0);
+  expect(rowsRead).toBeLessThanOrEqual(2 * asked.length + 10);
+  expect(await listMappedSeriesIds(env.DB, target.id, ["ser10"])).toEqual(new Set());
+});

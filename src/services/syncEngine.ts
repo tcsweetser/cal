@@ -18,7 +18,12 @@ import {
   setPendingSyncToken,
   promotePendingSyncToken,
 } from "../db/schema";
-import { isReplicaSeries, listSeriesIdsForSourceAccount, listSeriesMappingsForSource } from "../db/seriesSchema";
+import {
+  isReplicaSeries,
+  listMappedSeriesIds,
+  listSeriesIdsForSourceAccount,
+  listSeriesMappingsForSource,
+} from "../db/seriesSchema";
 import {
   MAX_CALENDAR_API_CALLS_PER_RUN,
   CallBudget,
@@ -81,8 +86,11 @@ function hasEnded(event: GoogleCalendarEvent, nowMs: number): boolean {
 // sends without the replica marker. Series and exceptions are always queued,
 // past ones too, since a replica series also expands into the past. An ended
 // single is dropped unless it used to be a series that still has replicas,
-// which must go. Sorted so a series drains before its exceptions whatever
-// order Google listed them in.
+// which must go. Sorted by queueOrder whatever order Google listed them in,
+// and among series, those with no replica yet go first: on a "this and
+// following" split, the later half's insert drains before the original's
+// truncating patch, so a budget cut between them never leaves the following
+// instances free.
 async function selectForQueue(
   db: D1Database,
   account: AccountRow,
@@ -113,8 +121,12 @@ async function selectForQueue(
     }
     kept.push(event);
   }
-  // Array.prototype.sort is stable, so Google's order holds within each kind.
-  return kept.sort((a, b) => queueOrder(a) - queueOrder(b));
+  // Only needed when there are two series to order.
+  const seriesIds = kept.filter((e) => classifyEvent(e) === "series").map((e) => e.id);
+  const mapped = seriesIds.length > 1 ? await listMappedSeriesIds(db, account.id, seriesIds) : new Set<string>();
+  const rank = (e: GoogleCalendarEvent) => queueOrder(e) * 2 + (mapped.has(e.id) ? 1 : 0);
+  // Array.prototype.sort is stable, so Google's order holds within each rank.
+  return kept.sort((a, b) => rank(a) - rank(b));
 }
 
 // A forced full re-sync (after a 410) is timeMin-bounded and doesn't reliably
