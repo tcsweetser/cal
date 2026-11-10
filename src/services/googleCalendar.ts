@@ -2,6 +2,8 @@
 // ever read/written via its own "primary" calendar (see plan.md §5) — so
 // calendarId is always "primary", never parameterized.
 
+import { retryDelayMs } from "../lib/retry";
+
 const EVENTS_URL = "https://www.googleapis.com/calendar/v3/calendars/primary/events";
 const CALENDAR_URL = "https://www.googleapis.com/calendar/v3/calendars/primary";
 const FREEBUSY_URL = "https://www.googleapis.com/calendar/v3/freeBusy";
@@ -76,9 +78,7 @@ async function googleFetch(url: string, init: RequestInit): Promise<Response> {
     res = await fetch(url, init);
     const retryable = res.status === 429 || res.status >= 500;
     if (!retryable || attempt === MAX_RETRY_ATTEMPTS) return res;
-    const retryAfterHeader = res.headers.get("Retry-After");
-    const delayMs = retryAfterHeader ? Number(retryAfterHeader) * 1000 : 2 ** attempt * 250;
-    await sleep(delayMs);
+    await sleep(retryDelayMs(res.headers.get("Retry-After"), attempt));
   }
   return res!;
 }

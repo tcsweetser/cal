@@ -5,6 +5,7 @@
 // npm dependency).
 
 import type { Env } from "../types";
+import { retryDelayMs } from "./retry";
 
 const RESEND_URL = "https://api.resend.com/emails";
 const MAX_RETRY_ATTEMPTS = 3;
@@ -39,9 +40,7 @@ async function resendFetch(apiKey: string, body: unknown): Promise<Response> {
     });
     const retryable = res.status === 429 || res.status >= 500;
     if (!retryable || attempt === MAX_RETRY_ATTEMPTS) return res;
-    const retryAfterHeader = res.headers.get("Retry-After");
-    const delayMs = retryAfterHeader ? Number(retryAfterHeader) * 1000 : 2 ** attempt * 250;
-    await sleep(delayMs);
+    await sleep(retryDelayMs(res.headers.get("Retry-After"), attempt));
   }
   return res!;
 }
