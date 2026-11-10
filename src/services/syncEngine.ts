@@ -15,6 +15,7 @@ import {
   findActiveSyncLog,
   enqueueEvents,
   countQueuedEvents,
+  hasQueuedEvents,
   dequeuePendingEvents,
   deleteQueuedEvent,
   setPendingSyncToken,
@@ -367,8 +368,8 @@ async function syncAccount(
   let processed = 0;
   const errors: string[] = [];
 
-  const alreadyQueued = await countQueuedEvents(env.DB, account.id);
-  if (alreadyQueued === 0 && !budget.exhausted) {
+  const alreadyQueued = await hasQueuedEvents(env.DB, account.id);
+  if (!alreadyQueued && !budget.exhausted) {
     const accessToken = await tokens.get(account.id);
     const storedToken = await getSyncToken(env.DB, userId, account.id);
     // "Now", not a lookback window — a bare timeMin already includes future
@@ -486,7 +487,7 @@ async function syncAccount(
 
   // Only safe once nothing from the fetch(es) that produced it remains
   // unprocessed — see the comment on pending_sync_tokens in the migration.
-  if ((await countQueuedEvents(env.DB, account.id)) === 0) {
+  if (!(await hasQueuedEvents(env.DB, account.id))) {
     await promotePendingSyncToken(env.DB, userId, account.id);
   }
 

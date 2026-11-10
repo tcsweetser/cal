@@ -272,6 +272,13 @@ export async function countQueuedEvents(db: D1Database, accountId: string): Prom
   return row?.n ?? 0;
 }
 
+// For "is the queue empty?" questions. Reads one row, where countQueuedEvents
+// reads one per queued event, on every tick for as long as a backlog lasts.
+export async function hasQueuedEvents(db: D1Database, accountId: string): Promise<boolean> {
+  const row = await db.prepare("SELECT 1 FROM sync_queue WHERE account_id = ? LIMIT 1").bind(accountId).first();
+  return row !== null;
+}
+
 // FIFO: oldest-enqueued first, so a large backlog drains roughly in the
 // order Google originally returned it rather than an arbitrary order.
 export async function dequeuePendingEvents(
