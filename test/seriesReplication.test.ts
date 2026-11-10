@@ -283,3 +283,49 @@ it("a failed replica series delete keeps the mapping for a later run", async () 
   expect(result.errors).toHaveLength(2);
   expect(await listSeriesMappingsForSource(env.DB, s.biz.id, "ser-faildel")).toHaveLength(2);
 });
+
+// Fails the first deleteExceptionRows run, as a transient D1 error would.
+function failFirstExceptionClear(db: D1Database): D1Database {
+  let failed = false;
+  return new Proxy(db, {
+    get(target, prop) {
+      if (prop !== "prepare") return Reflect.get(target, prop, target);
+      return (sql: string) => {
+        const stmt = target.prepare(sql);
+        if (!sql.startsWith("DELETE FROM exception_mappings")) return stmt;
+        return {
+          bind: (...values: unknown[]) => {
+            const bound = stmt.bind(...values);
+            return {
+              run: () => {
+                if (failed) return bound.run();
+                failed = true;
+                return Promise.reject(new Error("D1 transient failure"));
+              },
+            };
+          },
+        };
+      };
+    },
+  });
+}
+
+it("a failed exception-row clear after a patch is retried on the next run", async () => {
+  const s = await setup();
+  const event = weeklySeries("ser-clearfail");
+  await processSeries(await context(s, s.biz.id), event);
+  const mapping = (await findSeriesMapping(env.DB, s.biz.id, "ser-clearfail", s.primary.id))!;
+  await upsertExceptionFingerprint(env.DB, mapping.id, "2026-12-01T09:00:00+10:00", "fp");
+  const changed = { ...event, start: { ...event.start, dateTime: "2026-11-24T11:00:00+10:00" } };
+
+  const flaky = await context(s, s.biz.id);
+  flaky.env = { ...env, DB: failFirstExceptionClear(env.DB) };
+  await expect(processSeries(flaky, changed)).rejects.toThrow("D1 transient failure");
+  expect(await getExceptionFingerprint(env.DB, mapping.id, "2026-12-01T09:00:00+10:00")).toBe("fp");
+
+  await processSeries(await context(s, s.biz.id), changed);
+
+  expect(await getExceptionFingerprint(env.DB, mapping.id, "2026-12-01T09:00:00+10:00")).toBeNull();
+  const after = await findSeriesMapping(env.DB, s.biz.id, "ser-clearfail", s.primary.id);
+  expect(after!.fingerprint).toBe(seriesFingerprint(changed));
+});

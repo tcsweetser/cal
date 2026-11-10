@@ -114,11 +114,13 @@ export async function processSeries(ctx: ReplicationContext, event: GoogleCalend
       try {
         await patchEvent(targetToken, existing.target_series_id, payload);
         budget.spend();
-        await updateSeriesFingerprint(env.DB, existing.id, fingerprint);
         // Patching a series' times makes Google discard its exceptions on the
         // replica. Clearing on every patch lets the resent bundle re-apply
-        // whichever exceptions still exist.
+        // whichever exceptions still exist. Cleared before the fingerprint is
+        // recorded: if the clear fails, the retry must not see a matching
+        // fingerprint and skip it (a repeated patch is harmless).
         await deleteExceptionRows(env.DB, existing.id);
+        await updateSeriesFingerprint(env.DB, existing.id, fingerprint);
         processed++;
         continue;
       } catch (err) {
