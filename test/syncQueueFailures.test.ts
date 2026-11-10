@@ -1,7 +1,8 @@
 import { env } from "cloudflare:workers";
-import { it, expect, beforeEach } from "vitest";
+import { it, expect, beforeEach, vi } from "vitest";
 import { runFullSync } from "../src/services/syncEngine";
-import { createEventMapping, findEventMappingsBySource } from "../src/db/schema";
+import { createEventMapping, enqueueEvents, findEventMappingsBySource, markAccountStatus } from "../src/db/schema";
+import { storeTokens } from "../src/services/tokenManager";
 import { GoogleCalendarMock } from "./helpers/googleMock";
 import { createTestUser, createTestAccount } from "./helpers/fixtures";
 
@@ -44,11 +45,78 @@ async function createAccounts() {
   return { userId, primary, biz };
 }
 
+// Forces the next use of this account's token through the refresh endpoint.
+async function expireTokens(accountId: string): Promise<void> {
+  await storeTokens(env, accountId, { access_token: "expired", refresh_token: "refresh", expires_at: 0 });
+}
+
+function stubTokenEndpoint(response: () => Response): void {
+  const next = globalThis.fetch;
+  vi.stubGlobal("fetch", async (input: RequestInfo | URL, init?: RequestInit) =>
+    String(input).startsWith("https://oauth2.googleapis.com/token") ? response() : next(input, init),
+  );
+}
+
 let mock: GoogleCalendarMock;
 
 beforeEach(() => {
   mock = new GoogleCalendarMock();
   mock.install();
+});
+
+it("a non-JSON error page from the token endpoint keeps the delta queued", async () => {
+  const { userId, primary, biz } = await createAccounts();
+  await expireTokens(primary.id);
+  stubTokenEndpoint(() => new Response("<html>Bad Gateway</html>", { status: 502 }));
+  mock.queueList("tok-biz", { events: [opaqueEvent("ev-a", 1)], nextSyncToken: "biz-token-1" });
+
+  await runFullSync(env, userId);
+
+  expect(await queuedCount(biz.id)).toBe(1);
+  expect(await storedSyncToken(biz.id)).toBeNull();
+});
+
+it("a corrupt queued event is dropped and the rest of the queue still drains", async () => {
+  const { userId, biz } = await createAccounts();
+  await enqueueEvents(env.DB, userId, biz.id, [
+    { id: "ev-corrupt", json: "{not json" },
+    { id: "ev-good", json: JSON.stringify(opaqueEvent("ev-good", 1)) },
+  ]);
+
+  await runFullSync(env, userId);
+
+  expect(await queuedCount(biz.id)).toBe(0);
+  expect(await findEventMappingsBySource(env.DB, biz.id, "ev-good")).toHaveLength(1);
+});
+
+it("a cancellation whose replica is on a revoked account doesn't block the queue", async () => {
+  const { userId, biz } = await createAccounts();
+  const revoked = await createTestAccount(userId, "secondary", {
+    email: "gone@example.com",
+    tag: "personal",
+    accessToken: "tok-gone",
+  });
+  await createEventMapping(env.DB, {
+    id: crypto.randomUUID(),
+    userId,
+    sourceAccountId: biz.id,
+    sourceEventId: "ev-x",
+    targetAccountId: revoked.id,
+    targetEventId: "replica-1",
+  });
+  await markAccountStatus(env.DB, revoked.id, "revoked");
+  await expireTokens(revoked.id);
+  stubTokenEndpoint(() => new Response(JSON.stringify({ error: "invalid_grant" }), { status: 400 }));
+  mock.queueList("tok-biz", {
+    events: [{ id: "ev-x", status: "cancelled" }, opaqueEvent("ev-good", 1)],
+    nextSyncToken: "biz-token-1",
+  });
+
+  await runFullSync(env, userId);
+
+  expect(await queuedCount(biz.id)).toBe(0);
+  expect(await storedSyncToken(biz.id)).toBe("biz-token-1");
+  expect(await findEventMappingsBySource(env.DB, biz.id, "ev-good")).toHaveLength(1);
 });
 
 it.each([500, 429, 401, 403])(

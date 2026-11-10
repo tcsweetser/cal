@@ -177,7 +177,6 @@ const NON_EVENT_4XX = new Set([401, 403, 408, 429]);
 // dropping it would lose the work, because the syncToken still advances once
 // the queue is empty and Google won't send that change again.
 function isUnprocessableEvent(err: unknown): boolean {
-  if (err instanceof SyntaxError) return true; // corrupt event_json
   return err instanceof GoogleApiError && err.status >= 400 && err.status < 500 && !NON_EVENT_4XX.has(err.status);
 }
 
@@ -233,7 +232,9 @@ async function deleteMappedReplicas(
       processed++;
     } catch (err) {
       errors.push(`mapping ${mapping.id}: ${errMessage(err)}`);
-      if (!isUnprocessableEvent(err)) retryLater = true;
+      // A revoked target stays unreachable until it's reconnected, so waiting
+      // for it would block the source account's queue indefinitely.
+      if (!isUnprocessableEvent(err) && !(err instanceof RefreshTokenInvalidError)) retryLater = true;
     }
   }
   return { processed, errors, retryLater };
@@ -478,8 +479,17 @@ async function syncAccount(
     if (batch.length === 0) break;
     for (const item of batch) {
       if (budget.exhausted) break;
+      // Parsed on its own so that only a corrupt queue row counts as corrupt.
+      // A SyntaxError from inside the try below is a bad response from Google.
+      let event: GoogleCalendarEvent;
       try {
-        const event = JSON.parse(item.event_json) as GoogleCalendarEvent;
+        event = JSON.parse(item.event_json) as GoogleCalendarEvent;
+      } catch (err) {
+        errors.push(`event ${item.event_id}: ${errMessage(err)}`);
+        await deleteQueuedEvent(env.DB, item.id);
+        continue;
+      }
+      try {
         if (event.status === "cancelled") {
           const mappings = await findEventMappingsBySource(env.DB, account.id, event.id);
           const removal = await deleteMappedReplicas(env, tokens, mappings, budget);
