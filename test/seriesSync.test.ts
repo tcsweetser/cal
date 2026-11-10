@@ -270,6 +270,8 @@ it("a replica series and its bare cancelled stubs in a target's own delta are ig
       weeklySeries(replicaOnPrimary, { summary: "Busy", extendedProperties: marker }),
       movedInstance(replicaOnPrimary, DEC1, 5, { summary: "Busy", extendedProperties: marker }),
       cancelledInstance(replicaOnPrimary, DEC8),
+      cancelledInstance(replicaOnPrimary, occurrence(3)),
+      cancelledInstance(replicaOnPrimary, occurrence(4)),
     ],
     nextSyncToken: "primary-token-loop",
   });
@@ -277,6 +279,8 @@ it("a replica series and its bare cancelled stubs in a target's own delta are ig
   await runFullSync({ ...env, DB: metered.db }, s.userId);
 
   expect(metered.calls.some((c) => c.sql.includes("INSERT INTO sync_queue"))).toBe(false);
+  // One replica-series lookup for all three stubs of the same series.
+  expect(metered.calls.filter((c) => c.sql.includes("WHERE target_account_id = ? AND target_series_id = ?"))).toHaveLength(1);
   expect(googleWrites()).toHaveLength(writesBefore);
   expect(await listSeriesMappingsForSource(env.DB, s.primary.id, replicaOnPrimary)).toHaveLength(0);
   expect(await queuedCount(s.primary.id)).toBe(0);

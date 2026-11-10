@@ -18,7 +18,7 @@ import {
   setPendingSyncToken,
   promotePendingSyncToken,
 } from "../db/schema";
-import { isReplicaSeries, listSeriesIdsForSourceAccount } from "../db/seriesSchema";
+import { isReplicaSeries, listSeriesIdsForSourceAccount, listSeriesMappingsForSource } from "../db/seriesSchema";
 import {
   MAX_CALENDAR_API_CALLS_PER_RUN,
   CallBudget,
@@ -50,10 +50,16 @@ import {
 // not genuinely still in progress — recover rather than deadlock forever.
 const STALE_LOCK_MS = 15 * 60 * 1000;
 
-// How many queued events to pull from D1 per drain iteration. Generous —
-// D1 has a separate, much higher (1,000 on Free) subrequest budget, so this
-// is bounded by the Calendar-API budget checked inside the loop, not by this.
+// How many queued events to pull from D1 per drain iteration.
 const QUEUE_DRAIN_BATCH_SIZE = 50;
+
+// Queue items drained per runFullSync, across every account. The call budget
+// alone doesn't bound D1: an item skipped by fingerprint (any change to a
+// series resends its whole bundle) spends no call but makes about 2 queries
+// per target. D1 allows 1,000 queries per invocation on Free, and every user
+// syncs in the same invocation, so one user's resent bundle must not use them
+// up. 60 items at that rate leaves room for the rest of the run.
+const MAX_QUEUE_ITEMS_PER_RUN = 60;
 
 // A single event that is over isn't worth queuing ("don't sync past events").
 // Google applies timeMin only to a full fetch, never with a syncToken, so this
@@ -72,8 +78,10 @@ function hasEnded(event: GoogleCalendarEvent, nowMs: number): boolean {
 // What a fetch puts in the queue. Replicas are dropped (the loop guard), and
 // so are bare cancelled stubs of a replica series' instances, which Google
 // sends without the replica marker. Series and exceptions are always queued,
-// past ones too, since a replica series also expands into the past. Sorted so
-// a series drains before its exceptions whatever order Google listed them in.
+// past ones too, since a replica series also expands into the past. An ended
+// single is dropped unless it used to be a series that still has replicas,
+// which must go. Sorted so a series drains before its exceptions whatever
+// order Google listed them in.
 async function selectForQueue(
   db: D1Database,
   account: AccountRow,
@@ -81,16 +89,26 @@ async function selectForQueue(
   nowMs: number,
 ): Promise<GoogleCalendarEvent[]> {
   const kept: GoogleCalendarEvent[] = [];
+  // A resent replica bundle repeats one series id across all its stubs.
+  const replicaSeries = new Map<string, boolean>();
   for (const event of events) {
     if (isReplica(event)) continue;
     const kind = classifyEvent(event);
-    if (kind === "single" && hasEnded(event, nowMs)) continue;
     if (
-      kind === "exception" &&
-      event.status === "cancelled" &&
-      (await isReplicaSeries(db, account.id, event.recurringEventId!))
+      kind === "single" &&
+      hasEnded(event, nowMs) &&
+      (await listSeriesMappingsForSource(db, account.id, event.id)).length === 0
     ) {
       continue;
+    }
+    if (kind === "exception" && event.status === "cancelled") {
+      const seriesId = event.recurringEventId!;
+      let isStub = replicaSeries.get(seriesId);
+      if (isStub === undefined) {
+        isStub = await isReplicaSeries(db, account.id, seriesId);
+        replicaSeries.set(seriesId, isStub);
+      }
+      if (isStub) continue;
     }
     kept.push(event);
   }
@@ -108,29 +126,28 @@ async function selectForQueue(
 // the budget.
 //
 // Not itself queued/resumable like the main event loop below: if the budget
-// runs out mid-reconciliation, whatever's left unchecked this round simply
-// isn't retried until the next 410 recovery (a rare event). Accepted
+// runs out mid-reconciliation, or any check or delete fails, the pass stops
+// there and whatever's left unchecked isn't retried until the next 410
+// recovery (a rare event). Stopping matters during an outage: moving on would
+// make one uncounted call per mapping, far past the subrequest cap. Accepted
 // tradeoff — reconciliation only runs after a syncToken expiry, so the
 // backlog here is bounded by how many mappings that one account has, not by
 // the same unbounded-first-sync scenario the queue below exists for.
 async function reconcileAfterFullResync(ctx: ReplicationContext, sourceAccessToken: string): Promise<BatchResult> {
   const { env, tokens, budget, source } = ctx;
-  let processed = 0;
-  const errors: string[] = [];
+  const total: BatchResult = { processed: 0, errors: [] };
 
   for (const seriesId of await listSeriesIdsForSourceAccount(env.DB, source.id)) {
-    if (budget.exhausted) break;
+    if (budget.exhausted) return total;
     try {
       const stillExists = await getEvent(sourceAccessToken, seriesId);
       budget.spend();
-      if (!stillExists) {
-        const result = await removeSeriesReplicas(ctx, seriesId);
-        processed += result.processed;
-        errors.push(...result.errors);
-      }
+      if (!stillExists) addInto(total, await removeSeriesReplicas(ctx, seriesId));
     } catch (err) {
-      errors.push(`reconcile series ${seriesId}: ${errMessage(err)}`);
+      total.errors.push(`reconcile series ${seriesId}: ${errMessage(err)}`);
+      return total;
     }
+    if (total.retryLater) return total;
   }
 
   const mappings = await findEventMappingsBySourceAccount(env.DB, source.id);
@@ -141,20 +158,18 @@ async function reconcileAfterFullResync(ctx: ReplicationContext, sourceAccessTok
     bySourceEvent.set(mapping.source_event_id, group);
   }
   for (const [sourceEventId, group] of bySourceEvent) {
-    if (budget.exhausted) break;
+    if (budget.exhausted) return total;
     try {
       const stillExists = await getEvent(sourceAccessToken, sourceEventId);
       budget.spend();
-      if (!stillExists) {
-        const result = await deleteMappedReplicas(env, tokens, group, budget);
-        processed += result.processed;
-        errors.push(...result.errors);
-      }
+      if (!stillExists) addInto(total, await deleteMappedReplicas(env, tokens, group, budget));
     } catch (err) {
-      errors.push(`reconcile ${sourceEventId}: ${errMessage(err)}`);
+      total.errors.push(`reconcile ${sourceEventId}: ${errMessage(err)}`);
+      return total;
     }
+    if (total.retryLater) return total;
   }
-  return { processed, errors };
+  return total;
 }
 
 /**
@@ -206,9 +221,12 @@ async function processCancelledTopLevel(ctx: ReplicationContext, event: GoogleCa
 // only after the single replicas are in place, so the slot is never free on a
 // target (replace before remove). If the budget ran out first, nothing is
 // removed: removeSeriesReplicas spends nothing once it's exhausted, and the
-// item stays queued.
+// item stays queued. An ended single is queued only when it has replica
+// series (see selectForQueue); those go, and the past event itself isn't
+// replicated.
 async function processSingleItem(ctx: ReplicationContext, event: GoogleCalendarEvent): Promise<BatchResult> {
   const { env, tokens, userId, source, allAccounts, budget } = ctx;
+  if (hasEnded(event, Date.now())) return removeSeriesReplicas(ctx, event.id);
   const total = await processSingleEvent(env, tokens, userId, source, event, allAccounts, budget);
   if (total.retryLater) return total;
   addInto(total, await removeSeriesReplicas(ctx, event.id));
@@ -287,11 +305,15 @@ async function drainQueue(
 ): Promise<BatchResult> {
   let processed = 0;
   const errors: string[] = [];
-  drain: while (!budget.exhausted) {
-    const batch = await dequeuePendingEvents(env.DB, account.id, QUEUE_DRAIN_BATCH_SIZE);
+  drain: while (!budget.exhausted && !budget.itemsExhausted) {
+    const limit = Math.min(QUEUE_DRAIN_BATCH_SIZE, budget.itemsRemaining);
+    const batch = await dequeuePendingEvents(env.DB, account.id, limit);
     if (batch.length === 0) break;
     for (const item of batch) {
-      if (budget.exhausted) break;
+      // Checked before taking an item, never after: the item cap doesn't stop
+      // the item just processed from leaving the queue.
+      if (budget.exhausted || budget.itemsExhausted) break drain;
+      budget.takeItem();
       // Parsed on its own so that only a corrupt queue row counts as corrupt.
       // A SyntaxError from inside the try below is a bad response from Google.
       let event: GoogleCalendarEvent;
@@ -345,7 +367,7 @@ async function syncAccount(
   const ctx: ReplicationContext = { env, tokens, budget, userId, source: account, allAccounts };
   const total: BatchResult = { processed: 0, errors: [] };
 
-  if (!(await hasQueuedEvents(env.DB, account.id)) && !budget.exhausted) {
+  if (!(await hasQueuedEvents(env.DB, account.id)) && !budget.exhausted && !budget.itemsExhausted) {
     addInto(total, await fetchIntoQueue(ctx));
   }
 
@@ -378,7 +400,7 @@ export async function runFullSync(env: Env, userId: string): Promise<void> {
   if (!acquired) return;
 
   const tokens = new TokenCache(env);
-  const budget = new CallBudget(MAX_CALENDAR_API_CALLS_PER_RUN);
+  const budget = new CallBudget(MAX_CALENDAR_API_CALLS_PER_RUN, MAX_QUEUE_ITEMS_PER_RUN);
   let totalProcessed = 0;
 
   try {

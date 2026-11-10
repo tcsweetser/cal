@@ -31,9 +31,18 @@ export const MAX_CALENDAR_API_CALLS_PER_RUN = 35;
 // spends one unit; callers check `exhausted` before starting further work
 // and stop cleanly (leaving remainder queued for the next invocation)
 // instead of running past the platform's hard limit.
+//
+// It also counts queue items drained, against a separate cap. An item that
+// needs no Google call (a resent, unchanged series bundle) spends no call but
+// still costs several D1 queries, and D1 has its own per-invocation limit.
+// `exhausted` is about calls only.
 export class CallBudget {
   private used = 0;
-  constructor(private readonly max: number) {}
+  private itemsTaken = 0;
+  constructor(
+    private readonly max: number,
+    private readonly maxItems = Number.POSITIVE_INFINITY,
+  ) {}
   get remaining(): number {
     return Math.max(0, this.max - this.used);
   }
@@ -42,6 +51,15 @@ export class CallBudget {
   }
   spend(n = 1): void {
     this.used += n;
+  }
+  get itemsRemaining(): number {
+    return Math.max(0, this.maxItems - this.itemsTaken);
+  }
+  get itemsExhausted(): boolean {
+    return this.itemsTaken >= this.maxItems;
+  }
+  takeItem(): void {
+    this.itemsTaken++;
   }
 }
 
