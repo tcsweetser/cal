@@ -230,6 +230,9 @@ export async function findInstanceByOriginalStart(
   const params = new URLSearchParams({
     timeMin: new Date(centreMs - INSTANCE_LOOKUP_MARGIN_MS).toISOString(),
     timeMax: new Date(centreMs + INSTANCE_LOOKUP_MARGIN_MS).toISOString(),
+    // Cancelled instances are returned too: exception replication restores a
+    // previously cancelled replica instance when its source turns busy again.
+    showDeleted: "true",
     maxResults: "250",
   });
   const res = await googleFetch(`${EVENTS_URL}/${encodeURIComponent(seriesId)}/instances?${params.toString()}`, {

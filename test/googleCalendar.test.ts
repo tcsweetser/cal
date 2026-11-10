@@ -84,4 +84,19 @@ describe("findInstanceByOriginalStart", () => {
 
     expect(await findInstanceByOriginalStart(TOKEN, SERIES, { date: "2026-11-30" })).toBeNull();
   });
+
+  it("returns a cancelled instance and asks Google for deleted items", async () => {
+    const cancelled = {
+      id: `${SERIES}_20261124T000000Z`,
+      recurringEventId: SERIES,
+      status: "cancelled" as const,
+      originalStartTime: { dateTime: "2026-11-23T23:00:00Z" },
+    };
+    google.queueInstances(TOKEN, SERIES, [cancelled]);
+
+    const found = await findInstanceByOriginalStart(TOKEN, SERIES, original);
+    expect(found?.id).toBe(cancelled.id);
+    expect(found?.status).toBe("cancelled");
+    expect(google.instancesRequests[0]!.get("showDeleted")).toBe("true");
+  });
 });
