@@ -577,3 +577,13 @@ User-reported: live instance showing `revoked` status on connections. Root-cause
 A failed replica delete on a revoked target doesn't hold the queue, because that target stays unreachable until it's reconnected: the error is logged and the mapping is left in place, as it was before this change.
 
 **Residual**: the `COUNT(*)` for the "N queued" status note stays, so a backlog still costs N rows per account per tick (a third of before).
+
+## Recurring series replication (2026-11-10, branch `feat/series-replication`)
+
+Replicate recurring meetings as one replica series each, instead of one replica per instance in a 42-day window. This also replicates one-off events beyond 42 days.
+
+- Spec: `docs/superpowers/specs/2026-11-10-recurring-series-replication-design.md`
+- Plan: `docs/superpowers/plans/2026-11-10-recurring-series-replication.md`
+- Status: built on the branch (tasks 1-10), pending final review. Not pushed: a push to `master` deploys and starts the cutover.
+- Cutover and rollback steps: `DEPLOYMENT.md`, "Series replication cutover" and "Series replication rollback".
+- After deploy: watch the checks in DEPLOYMENT.md, then delete the spike calendar and the local spike token. Do not revoke the spike's Google grant.
