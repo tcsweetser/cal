@@ -99,12 +99,15 @@ it("instance mappings of a series are found by an indexed range, without reading
   await seedSingleMapping(s, "ser-range", "the-series-id-itself");
   await seedSingleMapping(s, "ser-rangex_20261124", "prefix-collision");
   await seedSingleMapping(s, "ser-range_", "bare-underscore");
+  // The later half of a "this and following" split, and one of its instances.
+  await seedSingleMapping(s, "ser-range_R20261201T230000", "split-series");
+  await seedSingleMapping(s, `ser-range_R20261201T230000${suffixFor(occurrence(3))}`, "split-instance");
   for (let n = 0; n < 3; n++) await seedSingleMapping(s, `ser-range${suffixFor(occurrence(n))}`, `instance-${n}`);
   const metered = meteredDb(env.DB);
 
   const found = await findEventMappingsForSeriesInstances(metered.db, s.biz.id, "ser-range");
 
-  expect(found.map((m) => m.target_event_id).sort()).toEqual(["bare-underscore", "instance-0", "instance-1", "instance-2"]);
+  expect(found.map((m) => m.target_event_id).sort()).toEqual(["instance-0", "instance-1", "instance-2"]);
   expect(metered.calls).toHaveLength(1);
   expect(metered.calls[0]!.rowsRead).toBeLessThanOrEqual(5);
 });

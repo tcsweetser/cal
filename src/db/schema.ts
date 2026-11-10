@@ -178,9 +178,11 @@ export async function findEventMappingsBySource(
 }
 
 // Every mapping whose source id is an instance of `seriesId`
-// (`<seriesId>_<suffix>`): singles made from a free series' busy instances,
-// and legacy per-instance replicas. A range on the source index rather than
-// LIKE, so it reads only the matching rows; "`" is the character after "_".
+// (`<seriesId>_<YYYYMMDD...>`): singles made from a free series' busy
+// instances, and legacy per-instance replicas. A range on the source index
+// rather than LIKE, so it reads only the matching rows. The range starts at a
+// digit after the "_" (":" is the character after "9"), so the later half of
+// a split (`<seriesId>_R<start>`) and its instances are not matched.
 export async function findEventMappingsForSeriesInstances(
   db: D1Database,
   sourceAccountId: string,
@@ -190,7 +192,7 @@ export async function findEventMappingsForSeriesInstances(
     .prepare(
       "SELECT * FROM event_mappings WHERE source_account_id = ? AND source_event_id >= ? AND source_event_id < ?",
     )
-    .bind(sourceAccountId, `${seriesId}_`, `${seriesId}\``)
+    .bind(sourceAccountId, `${seriesId}_0`, `${seriesId}_:`)
     .all<EventMappingRow>();
   return results;
 }
