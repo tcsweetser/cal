@@ -8,7 +8,8 @@ Triaged 2026-11-10. P0: handle now. P1: next. P2: can wait. Details for the queu
 
 ## P1
 
-- [x] (Built on branch `feat/series-replication`, pending review and deploy. Cutover steps are in `DEPLOYMENT.md`.) One-off events more than 42 days ahead are never replicated. The window filter drops them, the sync token advances, and only recurring series have the daily audit to pick them up later. Moving an event beyond the window has the same cause and leaves its replica at the old time. Known since August (`task_plan.md`, "pre-existing structural gap") but never tracked. Anything booked 6+ weeks ahead doesn't block the other calendars.
+- [ ] Timed ↔ all-day change on a replica series or instance. Google's PATCH merges fields, so sending `{start: {date}}` to a timed replica (or `{dateTime}` to an all-day one) is probably rejected with a 400, and a 400 drops the queue item. The replica then stays at the old time, so the moved meeting shows free on that target. Fix: send the other field as `null`, as single events already do. Check the API behaviour with the spike script first. (Fable review, Minor 4.)
+- [x] (Deployed 2026-11-10 as `be20da9`; all 5 accounts cut over by 09:30 UTC, legacy cleanup 0, no errors. Cutover steps are in `DEPLOYMENT.md`.) One-off events more than 42 days ahead are never replicated. The window filter drops them, the sync token advances, and only recurring series have the daily audit to pick them up later. Moving an event beyond the window has the same cause and leaves its replica at the old time. Known since August (`task_plan.md`, "pre-existing structural gap") but never tracked. Anything booked 6+ weeks ahead doesn't block the other calendars.
 - [ ] Retry counter or per-target parking, plus an alert on repeated error runs. Today one persistently failing target (5xx, 401, 403, or no stored tokens) holds every source queue that replicates to it, and only the logs page shows it.
 - [ ] Booking slot picker builds a new `Intl.DateTimeFormat` per candidate, up to 1,344 per request. Measured 35-75 ms in Node against the 10 ms Free CPU limit, so invitees may get error 1102. Fix: one formatter per time zone. Confirm in production observability first.
 - [ ] Settle the D1 calls-per-invocation limit on Free: the D1 docs page says 50, the Workers page says 1,000. The code assumes 1,000; if 50 is enforced, large deltas and the drain loop are already at risk.
@@ -22,6 +23,44 @@ Sync correctness, rare paths:
 - [ ] Mass cancellations (a deleted long series) bypass `CallBudget` and can reach the D1 call cap, leaving the lock stuck for 15 minutes. Self-heals over later ticks.
 - [ ] Changes made while a target was revoked aren't replayed when it reconnects.
 - [ ] `CallBudget` doesn't count list pages, retries or token refreshes, so the 50-subrequest cap is reachable. Since the drain fix this stalls a run instead of losing events.
+
+Series replication follow-ups (deferred in review, 2026-11-10). None can show a meeting as free except where stated. The worst case is doubled or stale busy:
+- [ ] A failed single-replica delete (400 or revoked target) doesn't return `retryLater`, so the series insert or exception patch goes ahead and the target shows doubled busy until the item is reprocessed.
+- [ ] A cancelled or free exception whose replica instance can't be found keeps any stale busy single on that target for good.
+- [ ] With mixed mapped and unmapped targets and the series not queued, the exception is skipped silently (add a `console.warn`), and a free exception doesn't delete a stale single on the unmapped target.
+- [ ] A still-confirmed exception next to a series converted to "does not repeat" replicates as an extra standalone busy single, until the source is deleted.
+- [ ] A single still running at fetch time but ended by drain time skips `processSingleEvent`, so its replica isn't updated. Untested.
+- [ ] After a series time change, each old exception's cancelled stub sends one cancel PATCH per target to a discarded instance id (K×T calls). Fix: when clearing exception rows, write the cancelled-stub fingerprint instead of deleting.
+- [ ] `findInstanceByOriginalStart` reads one page of instances (250 within ±48 h), so it can miss only on series shorter than about 30 minutes apart.
+- [ ] A series whose insert gets a 400 is dropped after one log line and has no replica. Search `sync_logs` for `failed: 400` now and then (0 since deploy).
+- [ ] The 35-call budget and 60-item cap are per `runFullSync` (per user), not per DO invocation. Fine with one user; revisit before a second user can sign in.
+- [ ] Steady state adds 3 primary-key reads of `series_cutover` and 2 indexed `listLegacyCleanup` queries per account per tick. Bounded; could be skipped once `completed_at` is set.
+- [ ] Cutover and rollback paths, which only matter for a re-cutover or a rollback:
+  - One persistent non-400 failure on a cleanup row stops cleanup for every account on every tick (`cutover.ts:92`). (Fable Minor 6.)
+  - The cutover's full fetch has no reconciliation, so a source event deleted between the last old-mode sync and the first full fetch may keep a stale busy replica until the next 410. For this cutover the window was 08:20–09:30 UTC on 2026-11-10. (Fable Minor 7.)
+  - A future-dated cleanup row with no series mapping is dropped as history. If that target later gets the replica series, the legacy future instances stay doubled. The code comment for these rows is inaccurate.
+  - Re-running `markCutoverReset` leaves `completed_at` set.
+  - Cleanup's 400 and revoked branches don't spend call budget. Rollback completion leaves `legacy_instance_cleanup` rows, rollback ticks write no `sync_logs` row, and the GET remaining count covers only the signed-in user.
+- [ ] Missing tests:
+  - `listLegacyCleanup` when the future half fills the limit, and when there are fewer rows than the limit.
+  - A prefix-collision series id (`abcd_…` vs `abc`).
+  - All-day exceptions at month and year end, and all-day exception bodies. The instance-lookup mock ignores `timeMin`/`timeMax`.
+  - A revoked target or a 400 on series delete.
+  - A budget cut between patches, and the budget running out right after a "gone" PATCH.
+  - A PATCH that fails with 500 or another non-gone error: it should write no fingerprint and leave the exception rows.
+  - A transparent exception on an unmapped series.
+  - The loop guard on the target's delta after a replica series is deleted.
+  - The series insert body's transparency, reminders and marker.
+  - The cutover's third-tick fetch.
+  - R22 with more than one account.
+  - The second `prepareCutover` throwing.
+- [ ] Tidy:
+  - Split `src/services/syncEngine.ts` (447 lines), `test/seriesReplication.test.ts` (616) and `test/cutover.test.ts` (461).
+  - Comment that all-day series rely on Google accepting a recurrence with no time zone (verified with the spike script).
+  - Drop the `as string` on `originalStartKey`.
+  - Remove the unused `_t` in a test and the unused `beforeEach` in `test/authReconnect.test.ts`.
+  - Remove the double blank line in `syncEngine.ts` and wrap the `buildReplicaPayload` signature.
+  - Check the moderate `npm audit` advisory for `hono` (it predates this work).
 
 Resource use, none near a limit today:
 - [ ] Sync-token churn: 5 rows written per account per tick even when nothing changed (82% of rows written, 3.6% of the daily limit).
