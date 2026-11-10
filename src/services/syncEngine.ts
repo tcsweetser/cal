@@ -44,6 +44,7 @@ import {
   removeSeriesReplicas,
   type ReplicationContext,
 } from "./seriesReplication";
+import { noteCutoverProgress, prepareCutover, runLegacyCleanup } from "./cutover";
 
 // A run older than this without completing is assumed crashed (Worker killed
 // mid-execution, uncaught exception before the finally-equivalent completes),
@@ -367,6 +368,17 @@ async function syncAccount(
   const ctx: ReplicationContext = { env, tokens, budget, userId, source: account, allAccounts };
   const total: BatchResult = { processed: 0, errors: [] };
 
+  // Items queued before series replication drain the way they were fetched,
+  // with nothing fetched meanwhile. The run that empties the queue resets the
+  // sync position, so the next run's fetch is a full one in the new mode.
+  if ((await prepareCutover(env, userId, account)) === "legacy-drain") {
+    const drained = await drainQueue(env, account, budget, (event) =>
+      processSingleEvent(env, tokens, userId, account, event, allAccounts, budget),
+    );
+    await prepareCutover(env, userId, account);
+    return drained;
+  }
+
   if (!(await hasQueuedEvents(env.DB, account.id)) && !budget.exhausted && !budget.itemsExhausted) {
     addInto(total, await fetchIntoQueue(ctx));
   }
@@ -380,6 +392,7 @@ async function syncAccount(
   if (!(await hasQueuedEvents(env.DB, account.id))) {
     await promotePendingSyncToken(env.DB, userId, account.id);
   }
+  await noteCutoverProgress(env, account);
 
   return { processed: total.processed, errors: total.errors };
 }
@@ -421,6 +434,17 @@ export async function runFullSync(env: Env, userId: string): Promise<void> {
       } catch (err) {
         errors.push(`${account.email}: ${errMessage(err)}`);
       }
+    }
+
+    // After every account's drain, with whatever budget is left. Only
+    // accounts whose cutover is complete have rows to clean up.
+    try {
+      const today = new Date().toISOString().slice(0, 10).replace(/-/g, "");
+      const cleanup = await runLegacyCleanup(env, tokens, budget, accounts, today);
+      totalProcessed += cleanup.processed;
+      errors.push(...cleanup.errors);
+    } catch (err) {
+      errors.push(`legacy cleanup: ${errMessage(err)}`);
     }
 
     // A budget cutoff isn't a failure — it's the queue doing exactly what
