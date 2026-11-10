@@ -1,20 +1,13 @@
 import { DurableObject } from "cloudflare:workers";
 import type { Env } from "../types";
 import { listUserIds } from "../db/schema";
-import { runFullSync, runDailyRecurringAudit } from "./syncEngine";
+import { runFullSync } from "./syncEngine";
 
 // Replaces the old `*/10` Cron Trigger (task_plan.md Phase 10): the account
 // has a fixed budget of 5 Cron Triggers, and a Durable Object alarm gives the
 // same cadence without spending one.
 const TICK_INTERVAL_MS = 10 * 60 * 1000;
 const ALARM_SLACK_MS = 30 * 1000;
-
-// KV key gating the once-a-day recurring-series audit (see syncEngine.ts's
-// runDailyRecurringAudit) — deliberately not its own schedule. Piggybacks on
-// the 10-minute tick instead: whichever tick is the first to land after this
-// key's date falls behind today's (UTC) date runs the audit once, then
-// updates the key so the rest of the day's ticks skip it.
-const DAILY_AUDIT_KV_KEY = "daily-recurring-audit:last-run-date";
 
 // Strictly after `now`, so an alarm that fires exactly on a boundary arms the
 // following one rather than itself. Aligned to wall-clock 10-minute marks to
@@ -34,22 +27,6 @@ async function runScheduledSync(env: Env): Promise<void> {
     } catch (err) {
       console.error(`Sync failed for user ${userId}:`, err instanceof Error ? err.message : err);
     }
-  }
-}
-
-// The KV write happens before the audit runs, not after: if the audit itself
-// fails partway, it shouldn't retry every 10 minutes for the rest of the day
-// (each tracked series already tolerates a stale covered_through and just
-// retries on the next real daily run — see runDailyRecurringAudit).
-async function maybeRunDailyAudit(env: Env): Promise<void> {
-  const today = new Date().toISOString().slice(0, 10);
-  const lastRun = await env.TOKEN_STORE.get(DAILY_AUDIT_KV_KEY);
-  if (lastRun === today) return;
-  await env.TOKEN_STORE.put(DAILY_AUDIT_KV_KEY, today);
-  try {
-    await runDailyRecurringAudit(env);
-  } catch (err) {
-    console.error("Daily recurring audit failed:", err instanceof Error ? err.message : err);
   }
 }
 
@@ -100,7 +77,6 @@ export class SyncScheduler extends DurableObject<Env> {
   // Separate from alarm() so tests can substitute it.
   async tick(): Promise<void> {
     await runScheduledSync(this.env);
-    await maybeRunDailyAudit(this.env);
   }
 }
 

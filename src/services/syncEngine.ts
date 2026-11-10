@@ -6,6 +6,7 @@ import {
   clearSyncToken,
   findEventMappingsBySource,
   findEventMappingsBySourceAccount,
+  findEventMappingsForSeriesInstances,
   tryStartSyncLog,
   completeSyncLog,
   findActiveSyncLog,
@@ -16,10 +17,8 @@ import {
   deleteQueuedEvent,
   setPendingSyncToken,
   promotePendingSyncToken,
-  trackRecurringSeriesIfNew,
-  listRecurringSeriesNeedingAudit,
-  advanceCoveredThrough,
 } from "../db/schema";
+import { isReplicaSeries, listSeriesIdsForSourceAccount } from "../db/seriesSchema";
 import {
   MAX_CALENDAR_API_CALLS_PER_RUN,
   CallBudget,
@@ -33,86 +32,80 @@ import {
 } from "./syncShared";
 import {
   fetchEventsDelta,
-  fetchRecurringInstances,
   getEvent,
   SyncTokenExpiredError,
   type GoogleCalendarEvent,
   type EventsDeltaResult,
 } from "./googleCalendar";
+import { classifyEvent, queueOrder } from "./recurrence";
+import {
+  processException,
+  processSeries,
+  removeSeriesReplicas,
+  type ReplicationContext,
+} from "./seriesReplication";
 
 // A run older than this without completing is assumed crashed (Worker killed
 // mid-execution, uncaught exception before the finally-equivalent completes),
 // not genuinely still in progress — recover rather than deadlock forever.
 const STALE_LOCK_MS = 15 * 60 * 1000;
 
-// How far into the future an initial/full sync fetches. See the comment at
-// its use in syncAccount for why this exists at all.
-const FUTURE_WINDOW_MS = 42 * 24 * 60 * 60 * 1000;
-
 // How many queued events to pull from D1 per drain iteration. Generous —
 // D1 has a separate, much higher (1,000 on Free) subrequest budget, so this
 // is bounded by the Calendar-API budget checked inside the loop, not by this.
 const QUEUE_DRAIN_BATCH_SIZE = 50;
 
-function eventStartMs(event: GoogleCalendarEvent): number | null {
-  const start = event.start?.dateTime ?? event.start?.date;
-  if (!start) return null;
-  const ms = new Date(start).getTime();
-  return Number.isNaN(ms) ? null : ms;
+// A single event that is over isn't worth queuing ("don't sync past events").
+// Google applies timeMin only to a full fetch, never with a syncToken, so this
+// is the one place the past bound holds on every fetch. It checks the END, so
+// an event already under way still blocks calendars; a date-only end is
+// exclusive, so an all-day event counts for its whole day. Cancellations are
+// never "over": a stale replica needs deleting however old it is.
+function hasEnded(event: GoogleCalendarEvent, nowMs: number): boolean {
+  if (event.status === "cancelled") return false;
+  const end = event.end?.dateTime ?? event.end?.date ?? event.start?.dateTime ?? event.start?.date;
+  if (!end) return false;
+  const endMs = new Date(end).getTime();
+  return !Number.isNaN(endMs) && endMs < nowMs;
 }
 
-function eventEndMs(event: GoogleCalendarEvent): number | null {
-  const end = event.end?.dateTime ?? event.end?.date;
-  if (!end) return null;
-  const ms = new Date(end).getTime();
-  return Number.isNaN(ms) ? null : ms;
+// What a fetch puts in the queue. Replicas are dropped (the loop guard), and
+// so are bare cancelled stubs of a replica series' instances, which Google
+// sends without the replica marker. Series and exceptions are always queued,
+// past ones too, since a replica series also expands into the past. Sorted so
+// a series drains before its exceptions whatever order Google listed them in.
+async function selectForQueue(
+  db: D1Database,
+  account: AccountRow,
+  events: GoogleCalendarEvent[],
+  nowMs: number,
+): Promise<GoogleCalendarEvent[]> {
+  const kept: GoogleCalendarEvent[] = [];
+  for (const event of events) {
+    if (isReplica(event)) continue;
+    const kind = classifyEvent(event);
+    if (kind === "single" && hasEnded(event, nowMs)) continue;
+    if (
+      kind === "exception" &&
+      event.status === "cancelled" &&
+      (await isReplicaSeries(db, account.id, event.recurringEventId!))
+    ) {
+      continue;
+    }
+    kept.push(event);
+  }
+  // Array.prototype.sort is stable, so Google's order holds within each kind.
+  return kept.sort((a, b) => queueOrder(a) - queueOrder(b));
 }
-
-// Google's Calendar API rejects timeMin/timeMax combined with syncToken (they
-// are mutually exclusive request parameters) — so the timeMin/timeMax bounds
-// passed to fetchEventsDelta on the initial/full-resync fetch do nothing for
-// the steady-state incremental (syncToken) fetch, which is what every account
-// uses after its first successful sync. Creating a new recurring event and
-// letting it arrive via an incremental delta is exactly what exposed this —
-// first for the future side (an indefinitely-recurring series with no end
-// date expanded to Google's ~2040 horizon, 700+ events from one account), and
-// then, after that fix, for the past side too: a new weekly series anchored
-// to a start date months in the past arrived with all 44 of its past
-// occurrences included, since nothing was bounding the lower edge on the
-// incremental path either (see task_plan.md for both incidents). This filter
-// is the real enforcement point for both bounds — applied uniformly to
-// whatever fetchEventsDelta returns, regardless of which path produced it, so
-// the window is actually respected rather than only requested. Cancellations
-// are exempt from both bounds: a stale replica needs deleting no matter how
-// far out (or how far in the past) it would have been, and dropping the
-// cancellation here would leave it orphaned forever.
-// The lower bound checks END time, not start: an event that started 10
-// minutes ago and runs another 50 isn't a "past event" in any useful sense,
-// it's ongoing and still needs to block calendars — using start here would
-// incorrectly reject anything already in progress. All-day events sharpen
-// this further: Google's date-only start parses as that day's midnight UTC,
-// so a same-day all-day event's start already reads as "before now" for any
-// time after 00:00 — checking its (exclusive) end instead correctly keeps it
-// in scope for its entire day. The upper bound stays start-based deliberately
-// — an event that starts near the far edge of the window with a 2-hour
-// duration should still count as "within FUTURE_WINDOW_MS," not be judged by
-// when it finishes.
-function withinSyncWindow(event: GoogleCalendarEvent, windowStartMs: number, windowEndMs: number): boolean {
-  if (event.status === "cancelled") return true;
-  const startMs = eventStartMs(event);
-  const endMs = eventEndMs(event) ?? startMs;
-  const notYetEnded = endMs === null || endMs >= windowStartMs;
-  const startsInTime = startMs === null || startMs <= windowEndMs;
-  return notYetEnded && startsInTime;
-}
-
 
 // A forced full re-sync (after a 410) is timeMin-bounded and doesn't reliably
 // report deletions the way an incremental (syncToken) sync does — Google
 // generally just omits events that no longer exist rather than returning a
 // cancelled stub. Without this, a source event cancelled while the token was
 // stale leaves its replicas on every target calendar permanently. Existence-
-// checks each previously-mapped source event directly instead.
+// checks each previously-replicated series, then each single, directly.
+// Series go first: there are few of them, and the singles alone can use up
+// the budget.
 //
 // Not itself queued/resumable like the main event loop below: if the budget
 // runs out mid-reconciliation, whatever's left unchecked this round simply
@@ -120,23 +113,33 @@ function withinSyncWindow(event: GoogleCalendarEvent, windowStartMs: number, win
 // tradeoff — reconciliation only runs after a syncToken expiry, so the
 // backlog here is bounded by how many mappings that one account has, not by
 // the same unbounded-first-sync scenario the queue below exists for.
-async function reconcileAfterFullResync(
-  env: Env,
-  tokens: TokenCache,
-  sourceAccountId: string,
-  sourceAccessToken: string,
-  budget: CallBudget,
-): Promise<BatchResult> {
-  const mappings = await findEventMappingsBySourceAccount(env.DB, sourceAccountId);
+async function reconcileAfterFullResync(ctx: ReplicationContext, sourceAccessToken: string): Promise<BatchResult> {
+  const { env, tokens, budget, source } = ctx;
+  let processed = 0;
+  const errors: string[] = [];
+
+  for (const seriesId of await listSeriesIdsForSourceAccount(env.DB, source.id)) {
+    if (budget.exhausted) break;
+    try {
+      const stillExists = await getEvent(sourceAccessToken, seriesId);
+      budget.spend();
+      if (!stillExists) {
+        const result = await removeSeriesReplicas(ctx, seriesId);
+        processed += result.processed;
+        errors.push(...result.errors);
+      }
+    } catch (err) {
+      errors.push(`reconcile series ${seriesId}: ${errMessage(err)}`);
+    }
+  }
+
+  const mappings = await findEventMappingsBySourceAccount(env.DB, source.id);
   const bySourceEvent = new Map<string, EventMappingRow[]>();
   for (const mapping of mappings) {
     const group = bySourceEvent.get(mapping.source_event_id) ?? [];
     group.push(mapping);
     bySourceEvent.set(mapping.source_event_id, group);
   }
-
-  let processed = 0;
-  const errors: string[] = [];
   for (const [sourceEventId, group] of bySourceEvent) {
     if (budget.exhausted) break;
     try {
@@ -149,6 +152,174 @@ async function reconcileAfterFullResync(
       }
     } catch (err) {
       errors.push(`reconcile ${sourceEventId}: ${errMessage(err)}`);
+    }
+  }
+  return { processed, errors };
+}
+
+/**
+ * Replicates one single event: a cancellation or a now-free event deletes its
+ * replicas, anything else is created or updated on every target. Knows
+ * nothing about series, so it also serves items queued before series
+ * replication, whatever they are.
+ */
+async function processSingleEvent(
+  env: Env,
+  tokens: TokenCache,
+  userId: string,
+  account: AccountRow,
+  event: GoogleCalendarEvent,
+  allAccounts: AccountRow[],
+  budget: CallBudget,
+): Promise<BatchResult> {
+  if (event.status === "cancelled" || event.transparency === "transparent") {
+    const mappings = await findEventMappingsBySource(env.DB, account.id, event.id);
+    return deleteMappedReplicas(env, tokens, mappings, budget);
+  }
+  const processed = await processCreateOrUpdate(env, tokens, userId, account, event, allAccounts, budget);
+  return { processed, errors: [] };
+}
+
+function addInto(total: BatchResult, part: BatchResult): void {
+  total.processed += part.processed;
+  total.errors.push(...part.errors);
+  if (part.retryLater) total.retryLater = true;
+}
+
+// A cancelled top-level item can be a series (its exceptions are not resent)
+// or a single. Removes the replica series, the id's single replicas, and the
+// singles keyed by its instance ids: busy instances of a free series, and
+// legacy per-instance replicas.
+async function processCancelledTopLevel(ctx: ReplicationContext, event: GoogleCalendarEvent): Promise<BatchResult> {
+  const { env, tokens, budget, source } = ctx;
+  const total: BatchResult = { processed: 0, errors: [] };
+  addInto(total, await removeSeriesReplicas(ctx, event.id));
+  if (total.retryLater) return total;
+  addInto(total, await deleteMappedReplicas(env, tokens, await findEventMappingsBySource(env.DB, source.id, event.id), budget));
+  if (total.retryLater) return total;
+  const instances = await findEventMappingsForSeriesInstances(env.DB, source.id, event.id);
+  addInto(total, await deleteMappedReplicas(env, tokens, instances, budget));
+  return total;
+}
+
+// A series that became "does not repeat" keeps its id. Its replica series go
+// only after the single replicas are in place, so the slot is never free on a
+// target (replace before remove). If the budget ran out first, nothing is
+// removed: removeSeriesReplicas spends nothing once it's exhausted, and the
+// item stays queued.
+async function processSingleItem(ctx: ReplicationContext, event: GoogleCalendarEvent): Promise<BatchResult> {
+  const { env, tokens, userId, source, allAccounts, budget } = ctx;
+  const total = await processSingleEvent(env, tokens, userId, source, event, allAccounts, budget);
+  if (total.retryLater) return total;
+  addInto(total, await removeSeriesReplicas(ctx, event.id));
+  return total;
+}
+
+function processQueuedEvent(ctx: ReplicationContext, event: GoogleCalendarEvent): Promise<BatchResult> {
+  switch (classifyEvent(event)) {
+    case "series":
+      return processSeries(ctx, event);
+    case "exception":
+      return processException(ctx, event);
+    case "cancelled-top-level":
+      return processCancelledTopLevel(ctx, event);
+    case "single":
+      return processSingleItem(ctx, event);
+  }
+}
+
+// Fetches the account's delta (full after a 410 or on the first sync), queues
+// it, and holds the next sync token until that queue drains.
+async function fetchIntoQueue(ctx: ReplicationContext): Promise<BatchResult> {
+  const { env, tokens, budget, userId, source: account } = ctx;
+  const accessToken = await tokens.get(account.id);
+  const storedToken = await getSyncToken(env.DB, userId, account.id);
+  // No far edge: a series is one item however long it runs, so there's
+  // nothing to bound. "Now" excludes past single events on a full fetch, and
+  // Google still returns a series that started earlier (spike, 2026-11-10).
+  const nowMs = Date.now();
+  const timeMin = new Date(nowMs).toISOString();
+
+  let result: EventsDeltaResult;
+  let recovered = false;
+  try {
+    result = storedToken
+      ? await fetchEventsDelta(accessToken, { syncToken: storedToken })
+      : await fetchEventsDelta(accessToken, { timeMin });
+    budget.spend();
+  } catch (err) {
+    if (!(err instanceof SyncTokenExpiredError)) throw err;
+    await clearSyncToken(env.DB, userId, account.id);
+    result = await fetchEventsDelta(accessToken, { timeMin });
+    budget.spend();
+    recovered = true;
+  }
+
+  const reconciliation = recovered
+    ? await reconcileAfterFullResync(ctx, accessToken)
+    : { processed: 0, errors: [] };
+
+  const toQueue = await selectForQueue(env.DB, account, result.events, nowMs);
+  await enqueueEvents(
+    env.DB,
+    userId,
+    account.id,
+    toQueue.map((event) => ({ id: event.id, json: JSON.stringify(event) })),
+  );
+  await setPendingSyncToken(env.DB, userId, account.id, result.nextSyncToken);
+  return reconciliation;
+}
+
+// Drains whatever's queued — what was just staged, or left over from a prior
+// budget-limited run — until either the queue empties or the shared call
+// budget runs out. Each item is only removed from the queue once fully
+// processed (or once the catch below decides to give up on it) — never
+// mid-processing, so a budget cutoff partway through leaves it there to
+// resume from cleanly next time (a target that already has a mapping is only
+// PATCHed again on retry). One gap: if an insert reaches Google but its
+// mapping is never written, the retry inserts a second replica and the first
+// stays unmapped.
+async function drainQueue(
+  env: Env,
+  account: AccountRow,
+  budget: CallBudget,
+  handle: (event: GoogleCalendarEvent) => Promise<BatchResult>,
+): Promise<BatchResult> {
+  let processed = 0;
+  const errors: string[] = [];
+  drain: while (!budget.exhausted) {
+    const batch = await dequeuePendingEvents(env.DB, account.id, QUEUE_DRAIN_BATCH_SIZE);
+    if (batch.length === 0) break;
+    for (const item of batch) {
+      if (budget.exhausted) break;
+      // Parsed on its own so that only a corrupt queue row counts as corrupt.
+      // A SyntaxError from inside the try below is a bad response from Google.
+      let event: GoogleCalendarEvent;
+      try {
+        event = JSON.parse(item.event_json) as GoogleCalendarEvent;
+      } catch (err) {
+        errors.push(`event ${item.event_id}: ${errMessage(err)}`);
+        await deleteQueuedEvent(env.DB, item.id);
+        continue;
+      }
+      try {
+        const result = await handle(event);
+        processed += result.processed;
+        errors.push(...result.errors);
+        // Something may clear later (or, for an exception, its series is
+        // still queued): keep the item and stop this account's drain.
+        if (result.retryLater) break drain;
+        if (!budget.exhausted) await deleteQueuedEvent(env.DB, item.id);
+      } catch (err) {
+        errors.push(`event ${item.event_id}: ${errMessage(err)}`);
+        // Stop rather than move on: the same failure would hit the rest of
+        // the queue, and the call budget only counts successful calls.
+        if (!isUnprocessableEvent(err)) break drain;
+        // A genuinely bad event (malformed payload Google rejects, etc.) —
+        // remove it from the queue so it can't wedge every future drain on
+        // the same failure forever.
+        await deleteQueuedEvent(env.DB, item.id);
+      }
     }
   }
   return { processed, errors };
@@ -171,141 +342,16 @@ async function syncAccount(
   allAccounts: AccountRow[],
   budget: CallBudget,
 ): Promise<BatchResult> {
-  let processed = 0;
-  const errors: string[] = [];
+  const ctx: ReplicationContext = { env, tokens, budget, userId, source: account, allAccounts };
+  const total: BatchResult = { processed: 0, errors: [] };
 
-  const alreadyQueued = await hasQueuedEvents(env.DB, account.id);
-  if (!alreadyQueued && !budget.exhausted) {
-    const accessToken = await tokens.get(account.id);
-    const storedToken = await getSyncToken(env.DB, userId, account.id);
-    // "Now", not a lookback window — a bare timeMin already includes future
-    // occurrences of a recurring series that started in the past (Google
-    // evaluates each occurrence's own time against timeMin), so this excludes
-    // only truly-past, non-recurring events, matching "don't sync past events
-    // unless they're repeating past the current date and time." Bounding the
-    // future side matters just as much: with singleEvents=true, an
-    // indefinitely-recurring series with no end date expands into one item
-    // per occurrence with no inherent cap — in production this queued 4,355
-    // events from a single account before this bound existed (see
-    // task_plan.md). Both bounds only take effect on this initial/full-resync
-    // fetch, though — Google rejects timeMin/timeMax combined with syncToken,
-    // so the incremental (steady-state) path below has no server-side bound
-    // at all in either direction (proven twice: once for the future side,
-    // then again for the past side when a newly-created series anchored
-    // months back arrived with all its past occurrences intact).
-    // withinSyncWindow (used just below, after the fetch) is the real
-    // enforcement point for both — timeMin/timeMax here are a courtesy that
-    // save a round trip when they do apply, never something to rely on alone.
-    const windowStartMs = Date.now();
-    const windowEndMs = windowStartMs + FUTURE_WINDOW_MS;
-    const timeMin = new Date(windowStartMs).toISOString();
-    const timeMax = new Date(windowEndMs).toISOString();
-
-    let result: EventsDeltaResult;
-    let recovered = false;
-    try {
-      result = storedToken
-        ? await fetchEventsDelta(accessToken, { syncToken: storedToken })
-        : await fetchEventsDelta(accessToken, { timeMin });
-      budget.spend();
-    } catch (err) {
-      if (!(err instanceof SyncTokenExpiredError)) throw err;
-      await clearSyncToken(env.DB, userId, account.id);
-      result = await fetchEventsDelta(accessToken, { timeMin });
-      budget.spend();
-      recovered = true;
-    }
-
-    if (recovered) {
-      const reconciliation = await reconcileAfterFullResync(env, tokens, account.id, accessToken, budget);
-      processed += reconciliation.processed;
-      errors.push(...reconciliation.errors);
-    }
-
-    // Replica events themselves are filtered out here (not worth queuing —
-    // isReplica is a pure local check, no API call either way), as are
-    // confirmed/tentative events starting outside the rolling window in
-    // either direction (see withinSyncWindow — the real enforcement point
-    // given Google won't bound the incremental/syncToken path itself).
-    // Everything else — including cancellations and now-free events — goes
-    // through the same queue so the drain loop below has one code path for
-    // all of it.
-    const toQueue = result.events
-      .filter((event) => !isReplica(event))
-      .filter((event) => withinSyncWindow(event, windowStartMs, windowEndMs))
-      .map((event) => ({ id: event.id, json: JSON.stringify(event) }));
-    await enqueueEvents(env.DB, userId, account.id, toQueue);
-    await setPendingSyncToken(env.DB, userId, account.id, result.nextSyncToken);
-
-    // First-sighting-only tracking (see trackRecurringSeriesIfNew) for the
-    // daily audit's benefit — deliberately over every non-replica event
-    // (including ones withinSyncWindow just filtered out), not just toQueue,
-    // since an occurrence can be the very evidence that a series exists even
-    // when that specific occurrence itself falls outside today's window.
-    // Distinct ids in one batch: one indefinite weekly series expands to about
-    // 730 instances, which is most of a run's 1,000 D1 calls if done singly.
-    const recurringSeriesIds = new Set<string>();
-    for (const event of result.events) {
-      if (!isReplica(event) && event.recurringEventId) recurringSeriesIds.add(event.recurringEventId);
-    }
-    await trackRecurringSeriesIfNew(env.DB, userId, account.id, [...recurringSeriesIds], timeMax);
+  if (!(await hasQueuedEvents(env.DB, account.id)) && !budget.exhausted) {
+    addInto(total, await fetchIntoQueue(ctx));
   }
 
-  // Drain whatever's queued — what was just staged above, or left over from
-  // a prior budget-limited run — until either the queue empties or the
-  // shared call budget runs out. Each item is only removed from the queue
-  // once fully processed (or once its own per-event try/catch below decides
-  // to give up on it) — never removed mid-processing, so a budget cutoff
-  // partway through leaves it there to resume from cleanly next time
-  // (a target that already has a mapping is only PATCHed again on retry). One
-  // gap: if an insert reaches Google but its mapping is never written, the
-  // retry inserts a second replica and the first stays unmapped.
-  drain: while (!budget.exhausted) {
-    const batch = await dequeuePendingEvents(env.DB, account.id, QUEUE_DRAIN_BATCH_SIZE);
-    if (batch.length === 0) break;
-    for (const item of batch) {
-      if (budget.exhausted) break;
-      // Parsed on its own so that only a corrupt queue row counts as corrupt.
-      // A SyntaxError from inside the try below is a bad response from Google.
-      let event: GoogleCalendarEvent;
-      try {
-        event = JSON.parse(item.event_json) as GoogleCalendarEvent;
-      } catch (err) {
-        errors.push(`event ${item.event_id}: ${errMessage(err)}`);
-        await deleteQueuedEvent(env.DB, item.id);
-        continue;
-      }
-      try {
-        if (event.status === "cancelled") {
-          const mappings = await findEventMappingsBySource(env.DB, account.id, event.id);
-          const removal = await deleteMappedReplicas(env, tokens, mappings, budget);
-          processed += removal.processed;
-          errors.push(...removal.errors);
-          if (removal.retryLater) break drain;
-        } else if (event.transparency === "transparent") {
-          const mappings = await findEventMappingsBySource(env.DB, account.id, event.id);
-          if (mappings.length > 0) {
-            const removal = await deleteMappedReplicas(env, tokens, mappings, budget);
-            processed += removal.processed;
-            errors.push(...removal.errors);
-            if (removal.retryLater) break drain;
-          }
-        } else {
-          processed += await processCreateOrUpdate(env, tokens, userId, account, event, allAccounts, budget);
-        }
-        if (!budget.exhausted) await deleteQueuedEvent(env.DB, item.id);
-      } catch (err) {
-        errors.push(`event ${item.event_id}: ${errMessage(err)}`);
-        // Stop rather than move on: the same failure would hit the rest of
-        // the queue, and the call budget only counts successful calls.
-        if (!isUnprocessableEvent(err)) break drain;
-        // A genuinely bad event (malformed payload Google rejects, etc.) —
-        // remove it from the queue so it can't wedge every future drain on
-        // the same failure forever.
-        await deleteQueuedEvent(env.DB, item.id);
-      }
-    }
-  }
+  const drained = await drainQueue(env, account, budget, (event) => processQueuedEvent(ctx, event));
+  total.processed += drained.processed;
+  total.errors.push(...drained.errors);
 
   // Only safe once nothing from the fetch(es) that produced it remains
   // unprocessed — see the comment on pending_sync_tokens in the migration.
@@ -313,7 +359,7 @@ async function syncAccount(
     await promotePendingSyncToken(env.DB, userId, account.id);
   }
 
-  return { processed, errors };
+  return { processed: total.processed, errors: total.errors };
 }
 
 export async function runFullSync(env: Env, userId: string): Promise<void> {
@@ -375,59 +421,5 @@ export async function runFullSync(env: Env, userId: string): Promise<void> {
     // Only reachable for failures outside the per-account loop (e.g. listing accounts itself failed).
     await completeSyncLog(env.DB, logId, "error", errMessage(err), totalProcessed);
     throw err;
-  }
-}
-
-// Separate, smaller budget from the main sync's MAX_CALENDAR_API_CALLS_PER_RUN
-// — this runs as an extra step inside the same scheduled tick (see
-// services/syncScheduler.ts), sharing that invocation's real Workers subrequest ceiling, so it
-// must not compete for the main sync's own allowance. In steady state this
-// audit only spends 1 call per tracked series (each gap is normally a single
-// day wide), so this cap is generous headroom, not a tight constraint.
-const MAX_DAILY_AUDIT_CALLS = 15;
-
-// Closes the gap left by the incremental (syncToken) sync path: an unedited
-// recurring series never generates a new delta, so nothing ever notices when
-// one of its occurrences rolls into the sync window (FUTURE_WINDOW_MS) as
-// "now" advances (see task_plan.md, and the migration comment on
-// tracked_recurring_series). This
-// runs once a day (gated by a KV timestamp in services/syncScheduler.ts, piggybacked
-// on the 10-minute tick rather than given a schedule of its own). For each series whose covered_through
-// has fallen behind today's window edge, looks ahead just the newly-exposed
-// gap via events.instances() (unbounded by the syncToken restriction — see
-// fetchRecurringInstances) and enqueues anything not already queued, reusing
-// the exact same sync_queue/budget/resumability machinery the normal 10-
-// minute sync already relies on, rather than duplicating replication logic
-// here. Deliberately outside runFullSync's per-user sync_logs lock — this
-// touches a different table (tracked_recurring_series) and a disjoint set of
-// API calls, so it can safely run independently without contending for that
-// lock or being mistaken for a stuck sync run.
-export async function runDailyRecurringAudit(env: Env): Promise<void> {
-  const nowMs = Date.now();
-  const windowEndIso = new Date(nowMs + FUTURE_WINDOW_MS).toISOString();
-  const series = await listRecurringSeriesNeedingAudit(env.DB, windowEndIso);
-  if (series.length === 0) return;
-
-  const tokens = new TokenCache(env);
-  const budget = new CallBudget(MAX_DAILY_AUDIT_CALLS);
-
-  for (const row of series) {
-    if (budget.exhausted) break;
-    try {
-      const accessToken = await tokens.get(row.account_id);
-      const instances = await fetchRecurringInstances(accessToken, row.recurring_event_id, row.covered_through, windowEndIso);
-      budget.spend();
-
-      const toQueue = instances
-        .filter((event) => !isReplica(event))
-        .map((event) => ({ id: event.id, json: JSON.stringify(event) }));
-      await enqueueEvents(env.DB, row.user_id, row.account_id, toQueue);
-      await advanceCoveredThrough(env.DB, row.account_id, row.recurring_event_id, windowEndIso);
-    } catch (err) {
-      // One series' failure (revoked token, transient API error) shouldn't
-      // stop the rest of the audit — left with a stale covered_through, so
-      // it's simply retried on the next daily run rather than lost.
-      console.error(`Daily recurring audit failed for series ${row.recurring_event_id}:`, errMessage(err));
-    }
   }
 }

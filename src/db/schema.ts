@@ -177,6 +177,24 @@ export async function findEventMappingsBySource(
   return results;
 }
 
+// Every mapping whose source id is an instance of `seriesId`
+// (`<seriesId>_<suffix>`): singles made from a free series' busy instances,
+// and legacy per-instance replicas. A range on the source index rather than
+// LIKE, so it reads only the matching rows; "`" is the character after "_".
+export async function findEventMappingsForSeriesInstances(
+  db: D1Database,
+  sourceAccountId: string,
+  seriesId: string,
+): Promise<EventMappingRow[]> {
+  const { results } = await db
+    .prepare(
+      "SELECT * FROM event_mappings WHERE source_account_id = ? AND source_event_id >= ? AND source_event_id < ?",
+    )
+    .bind(sourceAccountId, `${seriesId}_`, `${seriesId}\``)
+    .all<EventMappingRow>();
+  return results;
+}
+
 // Used only for 410-recovery reconciliation (syncEngine.ts) — every mapping
 // sourced from one account, regardless of which event, so each can be
 // existence-checked against Google after a forced full re-sync.
@@ -279,15 +297,17 @@ export async function hasQueuedEvents(db: D1Database, accountId: string): Promis
   return row !== null;
 }
 
-// FIFO: oldest-enqueued first, so a large backlog drains roughly in the
-// order Google originally returned it rather than an arbitrary order.
+// FIFO: oldest-enqueued first, then insertion order. One fetch is enqueued in
+// one batch, so its rows usually share a millisecond timestamp, and the
+// rowid tie-break keeps the order syncAccount sorted them into (series before
+// their exceptions; an exception waiting on its queued series relies on it).
 export async function dequeuePendingEvents(
   db: D1Database,
   accountId: string,
   limit: number,
 ): Promise<SyncQueueItemRow[]> {
   const { results } = await db
-    .prepare("SELECT * FROM sync_queue WHERE account_id = ? ORDER BY created_at ASC LIMIT ?")
+    .prepare("SELECT * FROM sync_queue WHERE account_id = ? ORDER BY created_at ASC, rowid ASC LIMIT ?")
     .bind(accountId, limit)
     .all<SyncQueueItemRow>();
   return results;
@@ -335,58 +355,6 @@ export async function promotePendingSyncToken(
   await db
     .prepare("DELETE FROM pending_sync_tokens WHERE user_id = ? AND account_id = ? AND calendar_id = ?")
     .bind(userId, accountId, calendarId)
-    .run();
-}
-
-// --- Recurring series tracking (daily window-gap audit, see task_plan.md) ---
-
-export interface TrackedRecurringSeriesRow {
-  user_id: string;
-  account_id: string;
-  recurring_event_id: string;
-  covered_through: string;
-  created_at: string;
-}
-
-// Only records the FIRST time a series is seen — covered_through is meant to
-// advance solely via advanceCoveredThrough (the daily audit), never here, so
-// this deliberately does nothing on conflict rather than overwriting it.
-export async function trackRecurringSeriesIfNew(
-  db: D1Database,
-  userId: string,
-  accountId: string,
-  recurringEventIds: string[],
-  coveredThrough: string,
-): Promise<void> {
-  if (recurringEventIds.length === 0) return;
-  const stmt = db.prepare(
-    `INSERT INTO tracked_recurring_series (user_id, account_id, recurring_event_id, covered_through)
-     VALUES (?, ?, ?, ?)
-     ON CONFLICT (account_id, recurring_event_id) DO NOTHING`,
-  );
-  await db.batch(recurringEventIds.map((id) => stmt.bind(userId, accountId, id, coveredThrough)));
-}
-
-export async function listRecurringSeriesNeedingAudit(
-  db: D1Database,
-  windowEndIso: string,
-): Promise<TrackedRecurringSeriesRow[]> {
-  const { results } = await db
-    .prepare("SELECT * FROM tracked_recurring_series WHERE covered_through < ?")
-    .bind(windowEndIso)
-    .all<TrackedRecurringSeriesRow>();
-  return results;
-}
-
-export async function advanceCoveredThrough(
-  db: D1Database,
-  accountId: string,
-  recurringEventId: string,
-  newCoveredThrough: string,
-): Promise<void> {
-  await db
-    .prepare("UPDATE tracked_recurring_series SET covered_through = ? WHERE account_id = ? AND recurring_event_id = ?")
-    .bind(newCoveredThrough, accountId, recurringEventId)
     .run();
 }
 

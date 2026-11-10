@@ -46,10 +46,9 @@ export class GoogleCalendarMock {
   // trustedAccess.ts writes (no originEventId to key off of).
   private poisonAllInserts_ = false;
   // What the next events.instances() call for a given (accessToken,
-  // recurringEventId) pair should return — used by the daily recurring
-  // audit's tests (runDailyRecurringAudit, syncEngine.ts). Keyed same as
-  // listQueues but scoped per-series, since a real account can have more
-  // than one tracked series being audited in the same test.
+  // recurringEventId) pair should return — used by exception replication's
+  // lookup by original start (findInstanceByOriginalStart). Keyed same as
+  // listQueues but scoped per-series, since one test can replicate several.
   private instancesQueues = new Map<string, GoogleCalendarEvent[]>();
   // Query string of every LIST call (events.list), in order.
   listRequests: URLSearchParams[] = [];

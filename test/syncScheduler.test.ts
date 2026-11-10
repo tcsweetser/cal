@@ -12,6 +12,7 @@ import {
 import { describe, it, expect } from "vitest";
 import worker from "../src/index";
 import { nextTenMinuteBoundary } from "../src/services/syncScheduler";
+import { createTestUser } from "./helpers/fixtures";
 
 const TEN_MINUTES_MS = 10 * 60 * 1000;
 
@@ -103,15 +104,19 @@ describe("SyncScheduler", () => {
     });
   });
 
-  it("a real alarm run executes the sync and daily audit, then re-arms", async () => {
+  it("a real alarm run executes the sync, then re-arms", async () => {
+    // A user with nothing linked: the sync runs for them and logs a success.
+    const userId = await createTestUser();
     const stub = scheduler("alarm-real");
     await stub.ensure();
     expect(await runDurableObjectAlarm(stub)).toBe(true);
 
-    // No users exist, so the sync is a no-op; the audit's KV gate proves the
-    // second half of the tick ran too.
-    const today = new Date().toISOString().slice(0, 10);
-    expect(await env.TOKEN_STORE.get("daily-recurring-audit:last-run-date")).toBe(today);
+    const log = await env.DB.prepare("SELECT status FROM sync_logs WHERE user_id = ?")
+      .bind(userId)
+      .first<{ status: string }>();
+    expect(log?.status).toBe("success");
+    // The daily recurring audit is gone; nothing writes its KV gate any more.
+    expect(await env.TOKEN_STORE.get("daily-recurring-audit:last-run-date")).toBeNull();
 
     await runInDurableObject(stub, async (_instance, state) => {
       expectArmedOnFutureBoundary(await state.storage.getAlarm());
