@@ -17,13 +17,15 @@ export async function isSeriesRollbackActive(env: Env): Promise<boolean> {
 }
 
 // Clears the sync positions and cutover state so the reverted old code does a
-// full refetch. One batch: a crash cannot leave only part of it cleared.
+// full refetch, and the queue, since the old code would replicate a queued
+// series master as a one-off event. One batch: a crash cannot leave only part
+// of it cleared.
 async function clearSyncState(env: Env, userId: string): Promise<void> {
   const accountIds = (await listAccountsForUser(env.DB, userId)).map((a) => a.id);
   if (accountIds.length === 0) return;
   const marks = accountIds.map(() => "?").join(", ");
   await env.DB.batch(
-    ["sync_tokens", "pending_sync_tokens", "series_cutover"].map((table) =>
+    ["sync_tokens", "pending_sync_tokens", "series_cutover", "sync_queue"].map((table) =>
       env.DB.prepare(`DELETE FROM ${table} WHERE account_id IN (${marks})`).bind(...accountIds),
     ),
   );
@@ -33,7 +35,7 @@ async function clearSyncState(env: Env, userId: string): Promise<void> {
  * Deletes up to one run's budget of the user's replica series from their
  * target calendars. A 400 or a revoked target can't be retried usefully, so
  * the mapping goes anyway; any other failure stops the batch and keeps the
- * row for the next tick. When none remain, the sync state is cleared.
+ * row for the next tick. When none remain, the sync state and queue are cleared.
  */
 export async function runSeriesRollbackBatch(
   env: Env,

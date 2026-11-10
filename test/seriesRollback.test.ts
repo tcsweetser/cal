@@ -5,13 +5,13 @@ import { createExecutionContext, runInDurableObject, waitOnExecutionContext } fr
 import { it, expect, beforeEach, afterEach, vi, type Mock } from "vitest";
 import worker from "../src/index";
 import { createSession, SESSION_COOKIE } from "../src/middleware/auth";
-import { setPendingSyncToken, setSyncToken } from "../src/db/schema";
+import { enqueueEvents, setPendingSyncToken, setSyncToken } from "../src/db/schema";
 import { countSeriesMappingsForUser, createSeriesMapping, markCutoverComplete } from "../src/db/seriesSchema";
 import { storeTokens } from "../src/services/tokenManager";
 import { runSeriesRollbackBatch, SERIES_ROLLBACK_KV_KEY } from "../src/services/seriesRollback";
 import { MAX_CALENDAR_API_CALLS_PER_RUN } from "../src/services/syncShared";
 import { GoogleCalendarMock } from "./helpers/googleMock";
-import { seriesSetup, type SeriesSetup } from "./helpers/seriesEvents";
+import { queuedCount, seriesSetup, weeklySeries, type SeriesSetup } from "./helpers/seriesEvents";
 
 let mock: GoogleCalendarMock;
 let fetchSpy: Mock;
@@ -103,6 +103,26 @@ it("when the last series is gone, sync positions and cutover state are cleared",
   expect(await stateRows(s)).toBe(0);
   // Idempotent while the flag stays set.
   expect(await runSeriesRollbackBatch(env, s.userId)).toEqual({ removed: 0, remaining: 0 });
+});
+
+it("when the last series is gone, the user's queued items go too, so reverted code can't replicate a queued series", async () => {
+  const s = await seriesSetup();
+  const other = await seriesSetup();
+  for (let i = 0; i <= MAX_CALENDAR_API_CALLS_PER_RUN; i++) await seedSeries(s);
+  const master = weeklySeries("queued-master");
+  await enqueueEvents(env.DB, s.userId, s.biz.id, [{ id: master.id, json: JSON.stringify(master) }]);
+  await enqueueEvents(env.DB, s.userId, s.side.id, [{ id: "queued-single", json: "{}" }]);
+  await enqueueEvents(env.DB, other.userId, other.biz.id, [{ id: "other-user-item", json: "{}" }]);
+
+  expect((await runSeriesRollbackBatch(env, s.userId)).remaining).toBe(1);
+  // Not finished: the queue is kept with the rest of the sync state.
+  expect(await queuedCount(s.biz.id)).toBe(1);
+
+  expect(await runSeriesRollbackBatch(env, s.userId)).toEqual({ removed: 1, remaining: 0 });
+
+  expect(await queuedCount(s.biz.id)).toBe(0);
+  expect(await queuedCount(s.side.id)).toBe(0);
+  expect(await queuedCount(other.biz.id)).toBe(1);
 });
 
 it("a 400 on a delete drops the mapping and the batch carries on", async () => {
