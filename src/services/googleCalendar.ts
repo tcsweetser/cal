@@ -33,6 +33,10 @@ export interface GoogleCalendarEvent {
   // (syncEngine.ts) uses to discover which series exist at all, since we
   // never otherwise fetch the master event itself.
   recurringEventId?: string;
+  // RRULE/EXRULE/RDATE lines; present only on a recurring series' master event.
+  recurrence?: string[];
+  // On an exception: the start the instance had before it was changed.
+  originalStartTime?: GoogleEventDateTime;
   // Populated by Google once a conferenceData.createRequest (see
   // insertEventWithMeetLink below) resolves — trustedAccess.ts reads
   // entryPoints for the actual join URL.
