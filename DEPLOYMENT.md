@@ -175,6 +175,17 @@ Once the manual deploy above works, you can connect this repo to [Workers Builds
 
 **Once this is live, every push to `master` deploys to production immediately** — there's no manual review gate in between. Make sure anything you push there is something you actually want live.
 
+## Series replication rollback
+
+Reverting the series commits alone is not enough: the old code would expand recurring series again and create per-instance replicas next to the replica series. While a KV flag is set, scheduled ticks and **"Run sync now"** delete replica series instead of syncing. Do this in order:
+
+1. Signed in as the owner, `POST /api/admin/series-rollback` (for example `fetch("/api/admin/series-rollback", { method: "POST" })` from the browser console on the dashboard). It sets the flag and returns `{ "status": "rollback started" }`.
+2. Poll `GET /api/admin/series-rollback` until it reports `"remaining": 0`. Each tick removes up to 35 replica series. When none remain, it also clears the sync positions and cutover state, so the old code does a full refetch.
+3. Revert the series commits on `master` and push. The old code then refetches and rebuilds per-instance replicas.
+4. Delete the flag: `npx wrangler kv key delete "series-replication:rollback" --namespace-id <your-kv-namespace-id> -c wrangler.local.jsonc`.
+
+**Expect a gap.** A rollback leaves recurring meetings showing as FREE on target calendars. That window runs from the batch that deletes the replica series until the reverted old code has rebuilt the per-instance replicas, about 2 hours of ticks at 35 calls per tick. Roll back only if the new code is doing worse than that.
+
 ## Troubleshooting
 
 | Symptom | Likely cause |

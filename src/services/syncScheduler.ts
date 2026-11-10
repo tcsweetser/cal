@@ -2,6 +2,7 @@ import { DurableObject } from "cloudflare:workers";
 import type { Env } from "../types";
 import { listUserIds } from "../db/schema";
 import { runFullSync } from "./syncEngine";
+import { isSeriesRollbackActive, runSeriesRollbackBatch } from "./seriesRollback";
 
 // Replaces the old `*/10` Cron Trigger (task_plan.md Phase 10): the account
 // has a fixed budget of 5 Cron Triggers, and a Durable Object alarm gives the
@@ -21,9 +22,13 @@ export function nextTenMinuteBoundary(now: number): number {
 // user's accounts itself throwing) shouldn't stop other users' syncs.
 async function runScheduledSync(env: Env): Promise<void> {
   const userIds = await listUserIds(env.DB);
+  // Read once per tick. While the rollback flag is set the tick removes
+  // replica series instead of syncing, so it can't re-create them.
+  const rollback = await isSeriesRollbackActive(env);
   for (const userId of userIds) {
     try {
-      await runFullSync(env, userId);
+      if (rollback) await runSeriesRollbackBatch(env, userId);
+      else await runFullSync(env, userId);
     } catch (err) {
       console.error(`Sync failed for user ${userId}:`, err instanceof Error ? err.message : err);
     }
