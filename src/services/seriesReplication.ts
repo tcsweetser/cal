@@ -6,25 +6,31 @@ import {
   deleteExceptionRows,
   deleteSeriesMapping,
   findSeriesMapping,
+  getExceptionFingerprint,
+  isEventQueued,
   listSeriesMappingsForSource,
   updateSeriesFingerprint,
+  upsertExceptionFingerprint,
+  type SeriesMappingRow,
 } from "../db/seriesSchema";
 import { RefreshTokenInvalidError } from "./tokenManager";
 import {
   deleteEvent,
   EventGoneError,
+  findInstanceByOriginalStart,
   getCalendarTimeZone,
   insertEvent,
   patchEvent,
   type GoogleCalendarEvent,
   type GoogleEventDateTime,
 } from "./googleCalendar";
-import { seriesFingerprint } from "./recurrence";
+import { exceptionFingerprint, instanceSuffix, originalStartKey, seriesFingerprint } from "./recurrence";
 import {
   buildReplicaPayload,
   deleteMappedReplicas,
   errMessage,
   isUnprocessableEvent,
+  processCreateOrUpdate,
   targetsFor,
   type BatchResult,
   type CallBudget,
@@ -179,4 +185,114 @@ export async function removeSeriesReplicas(ctx: ReplicationContext, sourceSeries
     }
   }
   return { processed, errors, retryLater };
+}
+
+/**
+ * Mirrors one source exception (a moved, cancelled, or free/busy-changed
+ * instance) onto each target's replica series. Budget-aware and safe to
+ * resume: a target whose exception row already carries this fingerprint
+ * costs no call. Patch errors propagate to the drain, as in processSeries;
+ * only a gone instance is handled here, by one lookup.
+ */
+export async function processException(ctx: ReplicationContext, event: GoogleCalendarEvent): Promise<BatchResult> {
+  const { env, budget, source } = ctx;
+  const seriesId = event.recurringEventId;
+  if (!seriesId) throw new Error(`processException: ${event.id} has no recurringEventId`);
+
+  const mapped: SeriesMappingRow[] = [];
+  let anyUnmapped = false;
+  for (const { account: target } of targetsFor(source, ctx.allAccounts)) {
+    const mapping = await findSeriesMapping(env.DB, source.id, seriesId, target.id);
+    if (mapping) mapped.push(mapping);
+    else anyUnmapped = true;
+  }
+  // Its series drains first (queue order), so it gets a replica soon.
+  if (anyUnmapped && (await isEventQueued(env.DB, source.id, seriesId))) {
+    return { processed: 0, errors: [], retryLater: true };
+  }
+  const freesSlot = event.status === "cancelled" || event.transparency === "transparent";
+
+  // No replica series anywhere: the series is free (or was rejected or
+  // cancelled), so a busy exception stands alone as a single event.
+  if (mapped.length === 0) {
+    if (!freesSlot) {
+      const processed = await processCreateOrUpdate(
+        env,
+        ctx.tokens,
+        ctx.userId,
+        source,
+        event,
+        ctx.allAccounts,
+        budget,
+      );
+      return { processed, errors: [], retryLater: false };
+    }
+    const singles = await findEventMappingsBySource(env.DB, source.id, event.id);
+    return deleteMappedReplicas(env, ctx.tokens, singles, budget);
+  }
+
+  // Single replicas of this instance on a target that has a replica series
+  // would double its slot: busy exceptions replicated while the series was
+  // free, or a legacy per-instance replica. Targets without a replica series
+  // keep theirs, since nothing else blocks that time there.
+  let processed = 0;
+  const errors: string[] = [];
+  const mappedTargets = new Set(mapped.map((m) => m.target_account_id));
+  const singles = (await findEventMappingsBySource(env.DB, source.id, event.id)).filter((m) =>
+    mappedTargets.has(m.target_account_id),
+  );
+  if (singles.length > 0) {
+    const removal = await deleteMappedReplicas(env, ctx.tokens, singles, budget);
+    processed += removal.processed;
+    errors.push(...removal.errors);
+    if (removal.retryLater) return { processed, errors, retryLater: true };
+  }
+
+  const key = originalStartKey(event);
+  const fingerprint = exceptionFingerprint(event);
+  // Confirming with the source's times also restores a replica instance
+  // cancelled earlier (free, then busy again).
+  const body: Record<string, unknown> = freesSlot
+    ? { status: "cancelled" }
+    : { start: event.start, end: event.end, status: "confirmed" };
+  const suffix = instanceSuffix(event.id, seriesId);
+
+  for (const mapping of mapped) {
+    if (budget.exhausted) break;
+    if ((await getExceptionFingerprint(env.DB, mapping.id, key)) === fingerprint) continue;
+    const targetToken = await ctx.tokens.get(mapping.target_account_id);
+
+    // Google's instance ids are <seriesId>_<original start>, which the
+    // replica shares with its source (undocumented, so a miss is looked up).
+    if (suffix !== null) {
+      try {
+        await patchEvent(targetToken, mapping.target_series_id + suffix, body);
+        budget.spend();
+        await upsertExceptionFingerprint(env.DB, mapping.id, key, fingerprint);
+        processed++;
+        continue;
+      } catch (err) {
+        if (!(err instanceof EventGoneError)) throw err;
+        budget.spend();
+        if (budget.exhausted) break;
+      }
+    }
+
+    const instance = await findInstanceByOriginalStart(targetToken, mapping.target_series_id, event.originalStartTime!);
+    budget.spend();
+    if (instance) {
+      if (budget.exhausted) break;
+      try {
+        await patchEvent(targetToken, instance.id, body);
+        budget.spend();
+        processed++;
+      } catch (err) {
+        if (!(err instanceof EventGoneError)) throw err;
+        budget.spend();
+      }
+    }
+    // Recorded even when no instance exists, so a resend doesn't look again.
+    await upsertExceptionFingerprint(env.DB, mapping.id, key, fingerprint);
+  }
+  return { processed, errors, retryLater: false };
 }
