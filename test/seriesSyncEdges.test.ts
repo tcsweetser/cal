@@ -333,3 +333,25 @@ it("a series made \"does not repeat\" drains as a single before its old exceptio
   expect(await queuedCount(s.biz.id)).toBe(0);
   expect(await lastSyncLog(s.userId)).toEqual({ status: "success", message: null });
 });
+
+it("an exception without an original start is dropped with an error instead of wedging the queue", async () => {
+  const s = await seriesSetup();
+  const { originalStartTime: _dropped, ...broken } = movedInstance("ser-noorig", occurrence(1));
+  const good = movedInstance("ser-noorig", occurrence(2));
+  mock.queueList("tok-biz", {
+    events: [weeklySeries("ser-noorig"), broken, good],
+    nextSyncToken: "biz-token-noorig",
+  });
+
+  await runFullSync(env, s.userId);
+
+  const replicas = (await listSeriesMappingsForSource(env.DB, s.biz.id, "ser-noorig")).map((m) => m.target_series_id);
+  expect(mock.patches.map((p) => p.eventId).sort()).toEqual(
+    replicas.map((id) => `${id}${suffixFor(occurrence(2))}`).sort(),
+  );
+  expect(await queuedCount(s.biz.id)).toBe(0);
+  const log = await lastSyncLog(s.userId);
+  expect(log?.status).toBe("error");
+  expect(log?.message).toContain(broken.id);
+  expect(log?.message).toContain("originalStartTime");
+});

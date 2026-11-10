@@ -249,6 +249,15 @@ export async function processException(ctx: ReplicationContext, event: GoogleCal
     return deleteMappedReplicas(env, ctx.tokens, singles, budget);
   }
 
+  // Every lookup below is keyed by the original start. Binding undefined
+  // into D1 throws a non-400 error, which would hold the queue on this item
+  // forever, so it is dropped instead.
+  const originalStart = event.originalStartTime;
+  if (!originalStart?.dateTime && !originalStart?.date) {
+    const message = `exception ${event.id}: no originalStartTime, dropped`;
+    console.error(`Series replication: ${message}`);
+    return { processed: 0, errors: [message], retryLater: false };
+  }
   const key = originalStartKey(event);
   const fingerprint = exceptionFingerprint(event);
   // Confirming with the source's times also restores a replica instance
@@ -268,7 +277,7 @@ export async function processException(ctx: ReplicationContext, event: GoogleCal
     if (budget.exhausted) break;
     if ((await getExceptionFingerprint(env.DB, mapping.id, key)) === fingerprint) continue;
 
-    const outcome = await patchReplicaInstance(ctx, mapping, suffix, body, event.originalStartTime!);
+    const outcome = await patchReplicaInstance(ctx, mapping, suffix, body, originalStart);
     if (outcome === "stopped") break;
     if (outcome === "patched") {
       processed++;
