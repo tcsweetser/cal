@@ -76,7 +76,7 @@ Implement the Cloudflare Worker described in `plan.md` / `claude_code_prompt.md`
 - Roles finalized as 2-value (`primary`/`secondary`) + required `tag` on secondary accounts (`business`/`side_hustle`/`personal`), single tag per account, label-only (user decision, this session).
 - Topology finalized as single-hop fan-out (secondary→primary, primary→every secondary, secondary→every other secondary) — no multi-hop relay needed under the 2-role model.
 - Loop guard reverted from per-target origin-comparison back to blanket-skip-of-replicas — the per-target version was correct for the earlier 3-tier hub topology but caused duplicate event delivery under the finalized full-mesh topology (every secondary is always a source). Origin metadata (`originAccountId`/`originEventId`) is retained for provenance and the deletion cascade, not for loop prevention.
-- Stray `gemini-code-*` files kept as reference, excluded via `.gitignore` rather than deleted.
+- Stray `gemini-code-*` files kept as reference, excluded via `.gitignore` rather than deleted. (2026-11-13: deleted after all, at the owner's decision; nothing referenced them. The `.gitignore` pattern stays.)
 - Implementation plan follows `plan.md` §7 phase order unchanged; this file adds concrete file targets and a verification command per phase.
 
 ## Errors Encountered

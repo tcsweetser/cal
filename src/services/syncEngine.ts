@@ -64,7 +64,10 @@ const QUEUE_DRAIN_BATCH_SIZE = 50;
 // series resends its whole bundle) spends no call but makes about 2 queries
 // per target. D1 allows 1,000 queries per invocation on Free, and every user
 // syncs in the same invocation, so one user's resent bundle must not use them
-// up. 60 items at that rate leaves room for the rest of the run.
+// up. 60 items at that rate leaves room for the rest of the run. Sized on
+// Free; the production account moved to Workers Paid on 2026-11-11. The D1
+// limits page still lists 1,000 queries per invocation on Paid, so the value
+// is unchanged.
 const MAX_QUEUE_ITEMS_PER_RUN = 60;
 
 // A single event that is over isn't worth queuing ("don't sync past events").

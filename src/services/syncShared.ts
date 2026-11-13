@@ -22,6 +22,8 @@ import {
 // exists, which is what actually happened in production (see task_plan.md).
 // Kept well under 50 to leave headroom for the list/get calls each account's
 // fetch or reconciliation pass also makes against the same shared budget.
+// Sized for Free. The production account moved to Workers Paid on 2026-11-11;
+// the value is unchanged until the owner decides to raise it.
 export const MAX_CALENDAR_API_CALLS_PER_RUN = 35;
 
 // Tracks Google Calendar API calls spent so far this invocation, shared
