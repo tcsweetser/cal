@@ -4,7 +4,9 @@ Triaged 2026-11-10. P0: handle now. P1: next. P2: can wait. Details for the queu
 
 ## P0
 
-- [ ] Confirm the D1 fix in production. On or after 2026-11-11 01:00 UTC, `npx wrangler d1 info cal-replication-db -c wrangler.local.jsonc` should show `rows_read_24h` in the low thousands (it was 3,634,237). The 5M/day limit is account-wide, so HIT Pacific's production database shares it.
+- [x] Confirm the D1 fix in production. On or after 2026-11-11 01:00 UTC, `npx wrangler d1 info cal-replication-db -c wrangler.local.jsonc` should show `rows_read_24h` in the low thousands (it was 3,634,237). The 5M/day limit is account-wide, so HIT Pacific's production database shares it.
+  - **Passed, read 2026-11-14 04:51 UTC** (wrangler 4.120.1; the 24 h window is wholly after the fix): `rows_read_24h` 8,762, `read_queries_24h` 8,472, `rows_written_24h` 4,518. That is 0.18% of the 5M rows/day Free limit, down from 73% (about 415 times lower). It is above "low thousands", but rows read per query is about 1.0, so no query scans a table, and 8,472 queries over 144 ticks is about 59 per tick. HIT Pacific's production database is on the same account and shares the allowance.
+  - The account has been on Workers Paid since 2026-11-11, where D1 includes 25B rows read per month and bills past that instead of failing. The per-tick reads still need to stay flat as the tables grow.
 
 ## P1
 
