@@ -249,6 +249,8 @@ Reverting the series commits alone is not enough: the old code would expand recu
 
 The `engine_state` table holds one row, `engine_owner`, set to `cal` or `mailmcp` (migration `0011`, seeded `cal`). This Worker's replication engine runs only when the value is exactly `cal`. `runFullSync`, the series rollback batch and the scheduler tick each check it first. A missing table, a missing row, any other value or a D1 error all stop the engine, and the tick still re-arms its alarm. Nothing in this Worker writes the row. Booking and meeting polls do not read it and are not affected.
 
+**Reverting this release is safe only while `engine_owner` is `cal`.** CAL before this release never reads the flag and always runs its engine. If the value is `mailmcp`, set it back to `cal` *before* reverting or rolling back to an older version. Otherwise the revert puts CAL's old, ungated engine back alongside MailMCP's, and both run.
+
 Read-only check:
 
 ```
