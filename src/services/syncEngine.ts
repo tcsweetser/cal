@@ -1,4 +1,5 @@
 import type { Env } from "../types";
+import { engineMayRun } from "./engineOwner";
 import type { AccountRow, EventMappingRow } from "../db/schema";
 import {
   listActiveAccountsForUser,
@@ -413,6 +414,8 @@ async function syncAccount(
 }
 
 export async function runFullSync(env: Env, userId: string): Promise<void> {
+  // engine_owner gate: this engine runs only while the flag is exactly "cal".
+  if (!(await engineMayRun(env.DB))) return;
   const active = await findActiveSyncLog(env.DB, userId);
   if (active) {
     const ageMs = Date.now() - new Date(active.created_at).getTime();

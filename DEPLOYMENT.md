@@ -245,6 +245,16 @@ Reverting the series commits alone is not enough: the old code would expand recu
 
 **Expect a gap.** A rollback leaves recurring meetings showing as FREE on target calendars. That window runs from the batch that deletes the replica series until the reverted old code has rebuilt the per-instance replicas, about 2 hours of ticks at 35 calls per tick. Roll back only if the new code is doing worse than that.
 
+## Engine owner flag
+
+The `engine_state` table holds one row, `engine_owner`, set to `cal` or `mailmcp` (migration `0011`, seeded `cal`). This Worker's replication engine runs only when the value is exactly `cal`. `runFullSync`, the series rollback batch and the scheduler tick each check it first. A missing table, a missing row, any other value or a D1 error all stop the engine, and the tick still re-arms its alarm. Nothing in this Worker writes the row. Booking and meeting polls do not read it and are not affected.
+
+Read-only check:
+
+```
+npx wrangler d1 execute cal-replication-db --remote -c wrangler.local.jsonc --command "SELECT value, updated_at FROM engine_state WHERE key = 'engine_owner'"
+```
+
 ## Troubleshooting
 
 | Symptom | Likely cause |

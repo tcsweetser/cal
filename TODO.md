@@ -74,6 +74,8 @@ Process:
 
 ## Done
 
+- [x] Engine owner gate (phase 2): `runFullSync`, the series rollback batch and the scheduler tick stop unless `engine_owner` is exactly `cal` (migration `0011`, `src/services/engineOwner.ts`, `test/engineGate.test.ts`). Local commits on `feat/engine-owner`, not pushed.
+
 - [x] D1 rows_read incident (2026-11-10): `sync_logs` lock checks scanned the whole table on every tick, 3.6M rows/day against the 5M account-wide limit. Fixed with a partial index (migration 0009, `974c5cf`), then a follow-up bundle pushed as `bfd3407`: capped `Retry-After`, queue existence checks, batched recurring-series writes, and a queue drain that no longer drops events on transient failures.
 
 - [x] Fix: all 4 secondary accounts silently going `revoked` in production — root-caused (not a code bug): Google caps refresh tokens at 7 days for OAuth apps in "Testing" publishing status with sensitive scopes, and `DEPLOYMENT.md` had wrongly said Testing status was fine indefinitely (now corrected). Fixed by adding a `/privacy` page (required by Google's Branding form; pushed separately, `8ab8f3e`) and publishing the OAuth app to "In production" via Google Cloud Console. A second bug surfaced during reconnect (connect flow 409'd on any existing row, even a revoked one, with no recovery path) — fixed and pushed (`60b5931`) with a regression test (`test/authReconnect.test.ts`). All 5 accounts (primary + 4 secondaries) confirmed `active` in production D1. Full writeup in `task_plan.md`'s "Production incident (2026-08-21)" section. **Fully resolved.**
