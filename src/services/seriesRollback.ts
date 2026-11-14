@@ -4,6 +4,7 @@
 // replica series instead of syncing (DEPLOYMENT.md, "Series replication
 // rollback").
 import type { Env } from "../types";
+import { engineMayRun } from "./engineOwner";
 import { listAccountsForUser } from "../db/schema";
 import { countSeriesMappingsForUser, deleteSeriesMapping, listSeriesMappingsForUser } from "../db/seriesSchema";
 import { deleteEvent } from "./googleCalendar";
@@ -41,6 +42,8 @@ export async function runSeriesRollbackBatch(
   env: Env,
   userId: string,
 ): Promise<{ removed: number; remaining: number }> {
+  // engine_owner gate: no deletes unless the flag is exactly "cal".
+  if (!(await engineMayRun(env.DB))) return { removed: 0, remaining: await countSeriesMappingsForUser(env.DB, userId) };
   const budget = new CallBudget(MAX_CALENDAR_API_CALLS_PER_RUN);
   const tokens = new TokenCache(env);
   const rows = await listSeriesMappingsForUser(env.DB, userId, MAX_CALENDAR_API_CALLS_PER_RUN);

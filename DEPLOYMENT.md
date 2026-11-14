@@ -236,7 +236,7 @@ If it goes wrong, see the rollback section below.
 
 ## Series replication rollback
 
-Reverting the series commits alone is not enough: the old code would expand recurring series again and create per-instance replicas next to the replica series. While a KV flag is set, scheduled ticks and **"Run sync now"** delete replica series instead of syncing. Do this in order:
+Reverting the series commits alone is not enough: the old code would expand recurring series again and create per-instance replicas next to the replica series. While a KV flag is set, scheduled ticks and **"Run sync now"** delete replica series instead of syncing. The rollback batch now runs only while `engine_owner = cal`; with any other value it removes nothing. Do this in order:
 
 1. Signed in as the owner, `POST /api/admin/series-rollback` (for example `fetch("/api/admin/series-rollback", { method: "POST" })` from the browser console on the dashboard). It sets the flag and returns `{ "status": "rollback started" }`.
 2. Poll `GET /api/admin/series-rollback` until it reports `"remaining": 0`. Each tick removes up to 35 replica series. When none remain, it also clears the sync positions, cutover state and sync queue, so the old code does a full refetch and never replicates a queued series as a one-off event. If `remaining` stops falling, check the logs for `Series rollback: mapping ...` errors: a persistent non-400 failure on one mapping holds the batch. Confirm `remaining: 0` on a second poll before reverting.
@@ -244,6 +244,18 @@ Reverting the series commits alone is not enough: the old code would expand recu
 4. Delete the flag: `npx wrangler kv key delete "series-replication:rollback" --namespace-id <your-kv-namespace-id> -c wrangler.local.jsonc`.
 
 **Expect a gap.** A rollback leaves recurring meetings showing as FREE on target calendars. That window runs from the batch that deletes the replica series until the reverted old code has rebuilt the per-instance replicas, about 2 hours of ticks at 35 calls per tick. Roll back only if the new code is doing worse than that.
+
+## Engine owner flag
+
+The `engine_state` table holds one row, `engine_owner`, set to `cal` or `mailmcp` (migration `0011`, seeded `cal`). This Worker's replication engine runs only when the value is exactly `cal`. `runFullSync`, the series rollback batch and the scheduler tick each check it first. A missing table, a missing row, any other value or a D1 error all stop the engine, and the tick still re-arms its alarm. Nothing in this Worker writes the row. Booking and meeting polls do not read it and are not affected.
+
+**Reverting this release is safe only while `engine_owner` is `cal`.** CAL before this release never reads the flag and always runs its engine. If the value is `mailmcp`, set it back to `cal` *before* reverting or rolling back to an older version. Otherwise the revert puts CAL's old, ungated engine back alongside MailMCP's, and both run.
+
+Read-only check:
+
+```
+npx wrangler d1 execute cal-replication-db --remote -c wrangler.local.jsonc --command "SELECT value, updated_at FROM engine_state WHERE key = 'engine_owner'"
+```
 
 ## Troubleshooting
 

@@ -1,5 +1,6 @@
 import { DurableObject } from "cloudflare:workers";
 import type { Env } from "../types";
+import { engineMayRun } from "./engineOwner";
 import { listUserIds } from "../db/schema";
 import { runFullSync } from "./syncEngine";
 import { isSeriesRollbackActive, runSeriesRollbackBatch } from "./seriesRollback";
@@ -21,6 +22,11 @@ export function nextTenMinuteBoundary(now: number): number {
 // records them in sync_logs, but a structural failure (e.g. listing that
 // user's accounts itself throwing) shouldn't stop other users' syncs.
 async function runScheduledSync(env: Env): Promise<void> {
+  // engine_owner gate: the tick syncs nobody unless the flag is exactly "cal".
+  if (!(await engineMayRun(env.DB))) {
+    console.warn("engine_owner is not cal; skipping sync tick");
+    return;
+  }
   const userIds = await listUserIds(env.DB);
   // Read once per tick. While the rollback flag is set the tick removes
   // replica series instead of syncing, so it can't re-create them.
