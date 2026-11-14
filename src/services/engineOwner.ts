@@ -11,7 +11,7 @@ export async function readEngineOwner(db: D1Database): Promise<EngineOwner | nul
     const value = row?.value;
     return value === "cal" || value === "mailmcp" ? value : null;
   } catch (err) {
-    console.warn("engine_owner read failed", err instanceof Error ? err.name : "unknown");
+    console.warn("engine_owner read failed", err instanceof Error ? `${err.name}: ${err.message}` : "unknown");
     return null;
   }
 }

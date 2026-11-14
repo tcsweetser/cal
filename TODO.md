@@ -74,7 +74,7 @@ Process:
 
 ## Done
 
-- [x] Engine owner gate (phase 2): `runFullSync`, the series rollback batch and the scheduler tick stop unless `engine_owner` is exactly `cal` (migration `0011`, `src/services/engineOwner.ts`, `test/engineGate.test.ts`). Local commits on `feat/engine-owner`, not pushed.
+- [x] Engine owner gate (phase 2): `runFullSync`, the series rollback batch and the scheduler tick stop unless `engine_owner` is exactly `cal` (migration `0011`, `src/services/engineOwner.ts`, `test/engineGate.test.ts`). Shipped in PR 2d.
 
 - [x] D1 rows_read incident (2026-11-10): `sync_logs` lock checks scanned the whole table on every tick, 3.6M rows/day against the 5M account-wide limit. Fixed with a partial index (migration 0009, `974c5cf`), then a follow-up bundle pushed as `bfd3407`: capped `Retry-After`, queue existence checks, batched recurring-series writes, and a queue drain that no longer drops events on transient failures.
 

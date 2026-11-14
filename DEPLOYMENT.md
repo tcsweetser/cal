@@ -236,7 +236,7 @@ If it goes wrong, see the rollback section below.
 
 ## Series replication rollback
 
-Reverting the series commits alone is not enough: the old code would expand recurring series again and create per-instance replicas next to the replica series. While a KV flag is set, scheduled ticks and **"Run sync now"** delete replica series instead of syncing. Do this in order:
+Reverting the series commits alone is not enough: the old code would expand recurring series again and create per-instance replicas next to the replica series. While a KV flag is set, scheduled ticks and **"Run sync now"** delete replica series instead of syncing. The rollback batch now runs only while `engine_owner = cal`; with any other value it removes nothing. Do this in order:
 
 1. Signed in as the owner, `POST /api/admin/series-rollback` (for example `fetch("/api/admin/series-rollback", { method: "POST" })` from the browser console on the dashboard). It sets the flag and returns `{ "status": "rollback started" }`.
 2. Poll `GET /api/admin/series-rollback` until it reports `"remaining": 0`. Each tick removes up to 35 replica series. When none remain, it also clears the sync positions, cutover state and sync queue, so the old code does a full refetch and never replicates a queued series as a one-off event. If `remaining` stops falling, check the logs for `Series rollback: mapping ...` errors: a persistent non-400 failure on one mapping holds the batch. Confirm `remaining: 0` on a second poll before reverting.

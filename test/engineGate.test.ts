@@ -1,7 +1,7 @@
 // The engine_owner gate: CAL's engine runs only when the flag is exactly "cal". Each entry point checks it first.
 import { env } from "cloudflare:workers";
 import { runInDurableObject, runDurableObjectAlarm } from "cloudflare:test";
-import { it, expect, beforeEach, afterEach, type Mock } from "vitest";
+import { it, expect, beforeEach, afterEach, vi, type Mock } from "vitest";
 import { runFullSync } from "../src/services/syncEngine";
 import { runSeriesRollbackBatch } from "../src/services/seriesRollback";
 import { countSeriesMappingsForUser, createSeriesMapping } from "../src/db/seriesSchema";
@@ -109,7 +109,11 @@ async function fireTick(name: string): Promise<number | null> {
 it("a tick re-arms the alarm and syncs nobody when the owner is mailmcp", async () => {
   await setOwner("mailmcp");
   fetchSpy.mockClear();
+  const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
   const alarm = await fireTick("gate-off");
+  const skips = warn.mock.calls.filter((c) => c[0] === "engine_owner is not cal; skipping sync tick");
+  warn.mockRestore();
+  expect(skips).toHaveLength(1);
   expect(alarm! % 600_000).toBe(0);
   expect(alarm!).toBeGreaterThan(Date.now());
   expect(await logCount(s.userId)).toBe(0);
